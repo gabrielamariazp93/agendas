@@ -1,0 +1,225 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Service {
+  id                 String   @id @default(cuid())
+  name               String   @unique
+  specialtyCatalog   String?
+  chiefName          String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  users              User[]
+  agendas            Agenda[]
+}
+
+model User {
+  id            String        @id @default(cuid())
+  email         String        @unique
+  name          String
+  role          String
+  passwordHash  String
+  serviceId     String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  service       Service?      @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  sessions      AuthSession[]
+  chiefAgendas  Agenda[]      @relation("AgendaChief")
+  historyEvents AgendaHistory[] @relation("AgendaHistoryActor")
+  audits        AgendaAudit[] @relation("AgendaAuditActor")
+  notifications Notification[]
+}
+
+model Agenda {
+  id              String             @id @default(cuid())
+  externalId      String             @unique
+  serviceId       String?
+  chiefUserId     String?
+  serviceSpecialty String?
+  serviceName     String
+  chiefName       String
+  monthLabel      String
+  validFrom       DateTime?
+  validTo         DateTime?
+  status          String
+  version         Int                @default(1)
+  cnePct          Float              @default(0)
+  appointments    Int                @default(0)
+  pendingConfirm  Boolean            @default(false)
+  lastUpdated     BigInt
+  summaryAI       String?
+  rejectionReason String?
+  hoursJson       String             @default("{}")
+  distributionJson String            @default("{}")
+  sourceSnapshot  String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  service         Service?           @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  chiefUser       User?              @relation("AgendaChief", fields: [chiefUserId], references: [id], onDelete: SetNull)
+  professionals   AgendaProfessional[]
+  blocks          AgendaBlock[]
+  historyEntries  AgendaHistory[]
+  audits          AgendaAudit[]
+  notifications   Notification[]
+
+  @@index([serviceId, status])
+  @@index([chiefUserId])
+}
+
+model AgendaProfessional {
+  id         String       @id @default(cuid())
+  externalId String?
+  agendaId   String
+  name       String
+  type       String
+  professionCatalog String?
+  sortOrder  Int          @default(0)
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+  agenda     Agenda       @relation(fields: [agendaId], references: [id], onDelete: Cascade)
+  blocks     AgendaBlock[]
+
+  @@unique([agendaId, externalId])
+  @@index([agendaId, type])
+}
+
+model AgendaBlock {
+  id              String             @id @default(cuid())
+  externalId      String?
+  agendaId        String
+  professionalId  String
+  catalogActivityId String?
+  day             String
+  startMinutes    Int
+  durationMinutes Int
+  process         String?
+  activity        String?
+  isClinical      Boolean            @default(true)
+  hasPerformance  Boolean            @default(true)
+  performance     Float              @default(0)
+  suggestedPerformance Float?
+  performanceSource String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  agenda          Agenda             @relation(fields: [agendaId], references: [id], onDelete: Cascade)
+  professional    AgendaProfessional @relation(fields: [professionalId], references: [id], onDelete: Cascade)
+  catalogActivity CatalogActivity?   @relation(fields: [catalogActivityId], references: [id], onDelete: SetNull)
+
+  @@unique([agendaId, externalId])
+  @@index([professionalId, day, startMinutes])
+  @@index([catalogActivityId])
+}
+
+model AgendaHistory {
+  id          String   @id @default(cuid())
+  externalId  String?
+  agendaId    String
+  actorUserId String?
+  dateLabel   String
+  eventType   String?
+  action      String
+  fromStatus  String?
+  toStatus    String?
+  userName    String
+  comment     String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  agenda      Agenda   @relation(fields: [agendaId], references: [id], onDelete: Cascade)
+  actorUser   User?    @relation("AgendaHistoryActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@unique([agendaId, externalId])
+  @@index([agendaId, createdAt])
+}
+
+model AgendaAudit {
+  id          String   @id @default(cuid())
+  agendaId     String
+  actorUserId  String?
+  entityType   String
+  entityId     String?
+  action       String
+  userName     String?
+  payloadJson  String?
+  createdAt    DateTime @default(now())
+  agenda       Agenda   @relation(fields: [agendaId], references: [id], onDelete: Cascade)
+  actorUser    User?    @relation("AgendaAuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([agendaId, createdAt])
+}
+
+model AuthSession {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique
+  userId     String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model CatalogActivity {
+  id                 String   @id @default(cuid())
+  sourceId           String?
+  process            String
+  profession         String
+  specialty          String
+  activity           String
+  isClinical         Boolean
+  hasPerformance     Boolean
+  rawProcess         String?
+  rawType            String?
+  rawPerformanceFlag String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  blocks             AgendaBlock[]
+
+  @@unique([process, profession, specialty, activity])
+  @@index([profession, specialty])
+  @@index([process])
+}
+
+model ReferencePerformance {
+  id                 String   @id @default(cuid())
+  process            String
+  activity           String
+  specialty          String
+  nationalValue      Float?
+  localValue         Float?
+  notes              String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([process, activity, specialty])
+}
+
+model Notification {
+  id              String   @id @default(cuid())
+  agendaId         String?
+  destinationRole String?
+  userId          String?
+  text            String
+  read            Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  agenda          Agenda?  @relation(fields: [agendaId], references: [id], onDelete: Cascade)
+  user            User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([destinationRole, read])
+  @@index([userId, read])
+}
+
+model NormativeDocument {
+  id          String   @id @default(cuid())
+  title       String
+  summary     String
+  documentDate DateTime?
+  filePath    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
