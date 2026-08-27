@@ -1885,6 +1885,7 @@ DIAS.forEach((dia) => {
 });
 
 const ROLES = {
+  admin: { label: 'Administrador', color: '#8A5A44' },
   jefe_servicio: { label: 'Jefe de Servicio', color: '#4C7C74' },
   referente_programacion: { label: 'Referente de Programación', color: '#B8862E' },
   admision: { label: 'Admisión', color: '#3B6FA0' },
@@ -3803,10 +3804,6 @@ export default function App() {
     setSyncLabel('Sesión cerrada');
   }
 
-  if (authReady && !authUser) {
-    return <LoginScreen onLogin={handleLogin} loading={authLoading} error={authError} />;
-  }
-
   const agendasVisibles = useMemo(() => {
     const confirmadas = agendas.filter((a) => !a.pendienteConfirmar);
     if (role === 'jefe_servicio') return confirmadas.filter((a) => a.servicio === miServicio);
@@ -4031,6 +4028,10 @@ export default function App() {
   const notifsForRole = notifs.filter((n) => n.role === role);
   const agendaBaseParaNuevo = agendas.filter((a) => a.servicio === miServicio && !a.pendienteConfirmar).sort((a, b) => b.lastUpdated - a.lastUpdated)[0] || null;
   const agendaEnEditor = showEditorFor ? agendas.find((a) => a.id === showEditorFor) : null;
+
+  if (authReady && !authUser) {
+    return <LoginScreen onLogin={handleLogin} loading={authLoading} error={authError} />;
+  }
 
   return (
     <div className="w-full h-[720px] bg-[#F4F2ED] flex flex-col font-sans text-slate-800 rounded-2xl overflow-hidden border border-slate-200">

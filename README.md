@@ -2,12 +2,20 @@
 
 Base inicial para convertir el prototipo JSX en una aplicacion real con frontend React/Vite, API Node/Express y base de datos Prisma + SQLite.
 
+## Camino recomendado a produccion
+
+- App web completa en un solo servicio `Render`
+- Base de datos en `Neon Postgres`
+- Dominio propio conectado en Render
+
+En este paso la app ya queda preparada para que el backend Express pueda servir tambien el `dist` del frontend en produccion.
+
 ## Stack actual
 
 - Frontend: React + Vite
 - Backend: Node.js + Express
 - ORM: Prisma
-- BBDD local: SQLite
+- BBDD objetivo: Neon Postgres
 - Auth base: bearer token + sesiones en base de datos
 - IA opcional: Anthropic via `VITE_ANTHROPIC_API_KEY`
 
@@ -25,7 +33,12 @@ npm install
 cp .env.example .env
 ```
 
-3. Generar cliente Prisma y crear la base local:
+3. Completar en `.env` tus credenciales reales de Neon:
+
+- `DATABASE_URL`: URL pooler
+- `DIRECT_URL`: URL directa
+
+4. Generar cliente Prisma y crear el esquema en Neon:
 
 ```bash
 npm run db:generate
@@ -33,7 +46,7 @@ npm run db:push
 npm run db:seed
 ```
 
-4. Levantar backend y frontend en terminales separadas:
+5. Levantar backend y frontend en terminales separadas:
 
 ```bash
 npm run dev:server
@@ -46,11 +59,48 @@ Tambien puedes usar:
 npm run dev:full
 ```
 
-## URLs
+## URLs locales
 
 - Frontend: `http://127.0.0.1:5173`
 - Backend: `http://127.0.0.1:4000/api`
 - Healthcheck: `http://127.0.0.1:4000/api/health`
+
+## Produccion
+
+Despues de ejecutar `npm run build`, el servidor Express servira tambien los archivos de `dist`.
+
+- App completa: `https://tu-dominio.com`
+- API: `https://tu-dominio.com/api`
+
+## Deploy en Render
+
+El repositorio ya incluye [render.yaml](/Users/pabloabarca/Desktop/Proyecto/render.yaml:1) con una configuracion base para un `Web Service`.
+
+Valores principales:
+
+- `buildCommand`: `npm ci && npm run db:generate && npm run build`
+- `startCommand`: `npm start`
+- `healthCheckPath`: `/healthz`
+
+Variables que debes definir en Render:
+
+- `DATABASE_URL`: la URL pooled de Neon
+- `DIRECT_URL`: la URL directa de Neon
+
+Variables ya contempladas:
+
+- `APP_ENV=production`
+- `HOST=0.0.0.0`
+- `VITE_API_URL=/api`
+- `SESSION_SECRET` generado por Render
+
+## Comandos de base de datos
+
+- `npm run db:generate`: genera Prisma Client
+- `npm run db:push`: crea o sincroniza el esquema rapidamente
+- `npm run db:migrate -- --name init`: crea migraciones versionadas
+- `npm run db:deploy`: aplica migraciones en servidor
+- `npm run db:seed`: carga servicios y usuarios base
 
 ## Credenciales demo
 
