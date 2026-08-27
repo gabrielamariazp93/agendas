@@ -2781,7 +2781,7 @@ function ResumenProfesionalPanel({ bloques }) {
   );
 }
 
-function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especialidad, profesionales, bloques, onDescartar, onGuardarBorrador, onEnviar, onAgregarProfesional, onEliminarProfesional, onRenombrarProfesional, onLimpiarProfesional, onAgregarBloque, onEditarBloque, onEliminarBloque }) {
+function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especialidad, profesionales, bloques, onDescartar, onGuardarBorrador, onCerrar, onEnviar, onAgregarProfesional, onEliminarProfesional, onRenombrarProfesional, onLimpiarProfesional, onAgregarBloque, onEditarBloque, onEliminarBloque }) {
   const [activoId, setActivoId] = useState(profesionales[0]?.id || null);
   const [dialogo, setDialogo] = useState(null);
   const profesional = profesionales.find((p) => p.id === activoId) || null;
@@ -2806,7 +2806,7 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
             </button>
           )}
           {soloLectura ? (
-            <button onClick={onGuardarBorrador} className="text-xs text-slate-600 font-medium px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50">
+            <button onClick={onCerrar} className="text-xs text-slate-600 font-medium px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50">
               Cerrar
             </button>
           ) : (
@@ -2814,7 +2814,7 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
               Guardar borrador
             </button>
           )}
-          <button onClick={onGuardarBorrador} className="text-slate-400 hover:text-slate-700"><X size={20} /></button>
+          <button onClick={soloLectura ? onCerrar : onGuardarBorrador} className="text-slate-400 hover:text-slate-700"><X size={20} /></button>
         </div>
       </div>
 
@@ -4220,6 +4220,7 @@ export default function App() {
             await handleAction('confirmar_creacion', agendaEnEditor, {});
             setShowEditorFor(null);
           }}
+          onCerrar={() => setShowEditorFor(null)}
           onDescartar={async () => {
             try {
               await deleteAgenda(agendaEnEditor.id);
