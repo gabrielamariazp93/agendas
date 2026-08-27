@@ -120,22 +120,28 @@ async function upsertServices() {
 }
 
 async function replaceCatalog(catalog) {
-  await prisma.catalogActivity.deleteMany();
-
-  for (const row of catalog) {
-    await prisma.catalogActivity.create({
-      data: row,
-    });
-  }
+  await prisma.catalogActivity.createMany({
+    data: catalog,
+    skipDuplicates: true,
+  });
 }
 
 async function seedReferencePerformances() {
-  await prisma.referencePerformance.deleteMany();
-
   for (const specialtyRule of LOCAL_PERFORMANCE_RULES) {
     for (const [activity, localValue] of Object.entries(specialtyRule.values)) {
-      await prisma.referencePerformance.create({
-        data: {
+      await prisma.referencePerformance.upsert({
+        where: {
+          process_activity_specialty: {
+            process: 'Ambulatorio',
+            activity,
+            specialty: specialtyRule.specialty,
+          },
+        },
+        update: {
+          localValue,
+          notes: 'Valor local inicial cargado sin PDF normativo nacional adjunto.',
+        },
+        create: {
           process: 'Ambulatorio',
           activity,
           specialty: specialtyRule.specialty,
@@ -167,8 +173,23 @@ async function seedNormativeDocumentPlaceholders() {
     },
   ];
 
-  await prisma.normativeDocument.deleteMany();
   for (const doc of placeholders) {
+    const existing = await prisma.normativeDocument.findFirst({
+      where: { title: doc.title },
+      select: { id: true },
+    });
+
+    if (existing) {
+      await prisma.normativeDocument.update({
+        where: { id: existing.id },
+        data: {
+          summary: doc.summary,
+          filePath: doc.filePath,
+        },
+      });
+      continue;
+    }
+
     await prisma.normativeDocument.create({ data: doc });
   }
 }
