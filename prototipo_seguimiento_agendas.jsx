@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LabelList, Cell } from 'recharts';
 import {
   Bell, FileText, MessageSquare, LayoutGrid, Plus, X, ChevronDown, Pencil,
   CheckCircle2, XCircle, ArrowUpCircle, UploadCloud, Send, Sparkles, Loader2, BarChart3, History, Users
@@ -25,8 +25,14 @@ import {
   login,
   logout,
   confirmDraft,
-  syncAgendas,
   transitionAgenda,
+  extendAgendaVigencia,
+  fetchShiftRoster,
+  createShiftRotation,
+  updateShiftRotation,
+  deleteShiftRotation,
+  createShiftOverride,
+  deleteShiftOverride,
   updateBlock,
   updateProfessional,
 } from './src/lib/api.js';
@@ -40,7 +46,7 @@ import {
    Catálogo real de actividades por profesión y especialidad
 --------------------------------------------------------- */
 
-const SERVICIOS = ['Cardiología', 'Oftalmología', 'Traumatología', 'Medicina Interna', 'Otorrinolaringología', 'Ginecología'];
+const SERVICIOS = ['Cardiología', 'Oftalmología', 'Traumatología', 'Medicina Interna', 'Otorrinolaringología', 'Ginecología', 'Genética Clínica', 'Endoscopia y Gastroenterología', 'Neonatología', 'Geriatría', 'Nefrología Adulto', 'Terapeuta Ocupacional', 'Cirugía Adulto', 'Cuidados Paliativos'];
 
 // Catálogo real de actividades disponibles por profesión y especialidad (fuente: Listado_de_actividades.xlsx)
 const PROCESOS_CAT = ["Ambulatorio", "Hospitalizado", "Quirúrgico", "Urgencia"];
@@ -1783,6 +1789,23 @@ const ESPECIALIDAD_POR_SERVICIO = {
   'Medicina Interna': 'MEDICINA INTERNA',
   'Otorrinolaringología': 'OTORRINOLARINGOLOGÍA',
   'Ginecología': 'GINECOLOGÍA ADULTO',
+  'Genética Clínica': 'GENÉTICA CLÍNICA',
+  'Endoscopia y Gastroenterología': 'GASTROENTEROLOGÍA ADULTO',
+  'Neonatología': 'NEONATOLOGÍA',
+  'Geriatría': 'GERIATRÍA',
+  'Nefrología Adulto': 'NEFROLOGÍA ADULTO',
+  'Terapeuta Ocupacional': 'No Aplica',
+  'Cirugía Adulto': 'CIRUGÍA GENERAL ADULTO',
+  'Cuidados Paliativos': 'MEDICINA PALIATIVA',
+  'Pediatría': 'PEDIATRÍA',
+  'Enfermedad Respiratoria Pediátrica (Broncopulmonar Infantil)': 'ENFERMEDAD RESPIRATORIA PEDIÁTRICA (BRONCOPULMONAR INFANTIL)',
+  'Cardiología Pediátrica': 'CARDIOLOGÍA PEDIÁTRICA',
+  'Gastroenterología Pediátrica': 'GASTROENTEROLOGÍA PEDIÁTRICA',
+  'Nefrología Pediátrica': 'NEFROLOGÍA PEDIÁTRICA',
+  'Neurología Pediátrica': 'NEUROLOGÍA PEDIÁTRICA',
+  'Nutriólogo Pediátrico': 'NUTRIÓLOGO PEDIÁTRICO',
+  'Reumatología Pediátrica': 'REUMATOLOGÍA PEDIÁTRICA',
+  'Endocrinología Pediátrica': 'ENDOCRINOLOGÍA PEDIÁTRICA',
 };
 
 // Rendimientos oficiales por hora (RPE N°21 - Orientaciones para la Planificación y Programación en Red, MINSAL 2026)
@@ -1849,6 +1872,14 @@ const JEFES_POR_SERVICIO = {
   'Medicina Interna': 'Dra. Vidal',
   'Otorrinolaringología': 'Dr. Campos',
   'Ginecología': 'Dra. Herrera',
+  'Genética Clínica': 'Dra. Zeppelin',
+  'Endoscopia y Gastroenterología': 'Dra. Haberle',
+  'Neonatología': 'Dr. Carvajal',
+  'Geriatría': 'Dra. Elgueta',
+  'Nefrología Adulto': 'Dr. Castro',
+  'Terapeuta Ocupacional': 'Sra. Olivares',
+  'Cirugía Adulto': 'Dr. Lima',
+  'Cuidados Paliativos': 'Dra. Ramirez',
 };
 
 // Personas reales del Comité de Programación, Oferta y Demanda (Resolución RES/2226-2026, HSJD La Serena)
@@ -1936,6 +1967,14 @@ function nowStr() {
   return new Date().toLocaleString('es-CL', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
+// Una agenda aprobada deja de estar vigente cuando su vigenciaHasta ya pasó — normalmente porque
+// se aprobó una versión más nueva del mismo servicio, lo que cierra automáticamente la anterior.
+function esVigente(agenda) {
+  if (agenda.estado !== 'aprobada') return true;
+  if (!agenda.vigenciaHasta) return true;
+  return agenda.vigenciaHasta >= new Date().toISOString().slice(0, 10);
+}
+
 /* ---------------------------------------------------------
    Helpers para la estructura anidada de horas
 --------------------------------------------------------- */
@@ -1998,11 +2037,26 @@ function heatColorOcupacion(horasEnBloque) {
 function horasPorActividad(bloques) {
   const map = {};
   bloques.forEach((b) => {
+    if (b.esTurno) return;
     const key = b.actividad;
     map[key] = (map[key] || 0) + b.duracionMin / 60;
   });
   return Object.entries(map)
     .map(([actividad, horas]) => ({ actividad, horas: Math.round(horas * 10) / 10 }))
+    .sort((a, b) => b.horas - a.horas);
+}
+
+// Igual que horasPorActividad, pero separa por proceso (una misma prestación puede existir en varios procesos)
+function horasPorActividadYProceso(bloques) {
+  const map = {};
+  bloques.forEach((b) => {
+    if (b.esTurno) return;
+    const key = `${b.proceso}|||${b.actividad}`;
+    if (!map[key]) map[key] = { proceso: b.proceso, actividad: b.actividad, horas: 0 };
+    map[key].horas += b.duracionMin / 60;
+  });
+  return Object.values(map)
+    .map((item) => ({ ...item, horas: Math.round(item.horas * 10) / 10 }))
     .sort((a, b) => b.horas - a.horas);
 }
 
@@ -2042,6 +2096,9 @@ function calcularInsercion(anterior, siguiente) {
     clinica: ref ? ref.clinica : true,
     tieneRendimiento: ref ? ref.tieneRendimiento : true,
     rendimiento: ref ? ref.rendimiento : 2,
+    box: ref ? ref.box || '' : '',
+    observaciones: '',
+    esTurno: ref ? Boolean(ref.esTurno) : false,
   };
 }
 
@@ -2057,10 +2114,13 @@ function clonarProfesionalesYBloques(base) {
   return { profesionales, bloques };
 }
 
-// Deriva horas por proceso desde los bloques reales de cada profesional (duración variable)
+// Deriva horas por proceso desde los bloques reales de cada profesional (duración variable).
+// Los bloques de turno (Art. 15) no cuentan como horas de jornada — se excluyen acá para que
+// ningún cálculo derivado (totales, dashboards, proyecciones) los mezcle sin querer.
 function horasDesdeBloquesProf(bloques) {
   const h = horasVacias();
   bloques.forEach((b) => {
+    if (b.esTurno) return;
     if (!b.proceso) return;
     h[b.proceso] = (h[b.proceso] || 0) + b.duracionMin / 60;
   });
@@ -2071,6 +2131,7 @@ function horasDesdeBloquesProf(bloques) {
 function distribucionDesdeBloquesProf(bloques) {
   const d = distribucionVacia();
   bloques.forEach((b) => {
+    if (b.esTurno) return;
     const inicio = b.inicioMin;
     const fin = b.inicioMin + b.duracionMin;
     BLOQUES.forEach((label, idx) => {
@@ -2081,6 +2142,33 @@ function distribucionDesdeBloquesProf(bloques) {
     });
   });
   return d;
+}
+
+// Cuenta cuántos profesionales distintos tienen un bloque programado en cada día/tramo de 30 min
+function paralelosDesdeBloquesProf(bloques) {
+  const sets = {};
+  DIAS.forEach((dia) => {
+    sets[dia] = {};
+    BLOQUES.forEach((label) => { sets[dia][label] = new Set(); });
+  });
+  bloques.forEach((b) => {
+    if (b.esTurno) return;
+    const dia = b.dia;
+    const inicio = b.inicioMin;
+    const fin = b.inicioMin + b.duracionMin;
+    BLOQUES.forEach((label, idx) => {
+      const cellStart = HORA_INICIO_DIA * 60 + idx * 30;
+      const cellEnd = cellStart + 30;
+      const overlap = Math.min(fin, cellEnd) - Math.max(inicio, cellStart);
+      if (overlap > 0) sets[dia][label].add(b.profesionalId);
+    });
+  });
+  const counts = {};
+  DIAS.forEach((dia) => {
+    counts[dia] = {};
+    BLOQUES.forEach((label) => { counts[dia][label] = sets[dia][label].size; });
+  });
+  return counts;
 }
 
 function makeAgenda(servicio, jefe, horas, mes, cnePct, atenciones, distribucionHoraria, profesionales, bloquesProf, pendienteConfirmar, vigenciaDesde, vigenciaHasta) {
@@ -2372,9 +2460,12 @@ function LoginScreen({ onLogin, loading, error }) {
   );
 }
 
-function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, onConfirmar, onCancelar }) {
+function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, nivelFormacionInicial, tieneTurnoInicial, onConfirmar, onCancelar }) {
   const [nombre, setNombre] = useState(nombreInicial || '');
   const [tipo, setTipo] = useState(tipoInicial || TIPOS_PROFESIONAL[0]);
+  const [esBecado, setEsBecado] = useState(!!nivelFormacionInicial);
+  const [nivelDetalle, setNivelDetalle] = useState((nivelFormacionInicial || '').replace(/^Becado\s*/i, ''));
+  const [tieneTurno, setTieneTurno] = useState(!!tieneTurnoInicial);
   return (
     <div className="fixed inset-0 flex items-center justify-center z-[80] p-4" style={{ background: 'rgba(30,46,51,0.5)' }} onClick={onCancelar}>
       <div className="bg-white rounded-xl w-full max-w-xs p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
@@ -2389,14 +2480,37 @@ function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, onConfirmar, on
             className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm focus:outline-none"
           />
         </label>
-        <label className="text-xs text-slate-600 font-medium block">
+        <label className="text-xs text-slate-600 font-medium block mb-2.5">
           Tipo de profesional
           <select value={tipo} onChange={(e) => setTipo(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm bg-white">
             {TIPOS_PROFESIONAL.map((t) => <option key={t} value={t}>{t}</option>)}
           </select>
         </label>
+        <label className="flex items-center gap-2 text-xs text-slate-600 font-medium py-1 cursor-pointer">
+          <input type="checkbox" checked={esBecado} onChange={(e) => setEsBecado(e.target.checked)} />
+          Es becado / en formación
+        </label>
+        {esBecado && (
+          <label className="text-xs text-slate-600 font-medium block mt-1.5">
+            Nivel <span className="font-normal text-slate-400">(opcional, ej. R1, R2)</span>
+            <input
+              value={nivelDetalle}
+              onChange={(e) => setNivelDetalle(e.target.value)}
+              placeholder="Ej: R1"
+              className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm focus:outline-none"
+            />
+          </label>
+        )}
+        <label className="flex items-center gap-2 text-xs text-slate-600 font-medium py-1 mt-1.5 cursor-pointer">
+          <input type="checkbox" checked={tieneTurno} onChange={(e) => setTieneTurno(e.target.checked)} />
+          Tiene turno (Art. 15)
+        </label>
         <button
-          onClick={() => { if (nombre.trim()) onConfirmar(nombre.trim(), tipo); }}
+          onClick={() => {
+            if (!nombre.trim()) return;
+            const nivelFormacion = esBecado ? `Becado${nivelDetalle.trim() ? ` ${nivelDetalle.trim()}` : ''}` : '';
+            onConfirmar(nombre.trim(), tipo, nivelFormacion, tieneTurno);
+          }}
           style={{ background: '#4C7C74' }}
           className="w-full text-white text-sm font-medium py-2 rounded-lg mt-3"
         >
@@ -2425,7 +2539,7 @@ function Badge({ estado }) {
 
 function AgendaCard({ agenda, onOpen }) {
   const total = totalHorasAgenda(agenda.horas);
-  const ultimoEvento = agenda.historial[agenda.historial.length - 1];
+  const ultimoEvento = agenda.historial?.[agenda.historial.length - 1];
   return (
     <button
       onClick={() => onOpen(agenda)}
@@ -2441,20 +2555,66 @@ function AgendaCard({ agenda, onOpen }) {
           <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${agenda.version > 1 ? 'bg-[#F1EDFB] text-[#7A5CC7]' : 'bg-slate-100 text-slate-400'}`}>
             v{agenda.version}
           </span>
+          {!esVigente(agenda) && (
+            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">No vigente</span>
+          )}
         </div>
       </div>
       <div className="mt-2.5 flex items-center justify-between text-xs text-slate-500">
         <span>{total} hrs totales</span>
-        <span className="text-slate-400">Act. {ultimoEvento.fecha}</span>
+        <span className="text-slate-400">{ultimoEvento ? `Act. ${ultimoEvento.fecha}` : 'Sin actividad registrada'}</span>
       </div>
     </button>
   );
 }
 
+// Input con buffer local: solo notifica el cambio (onCommit) al perder foco o presionar Enter,
+// en vez de en cada tecla. Evita que un guardado en curso (llamada a la API) pise lo que el usuario está escribiendo.
+function EditableText({ value, onCommit, className, type = 'text', ...props }) {
+  const [local, setLocal] = useState(value ?? '');
+  useEffect(() => { setLocal(value ?? ''); }, [value]);
+  return (
+    <input
+      type={type}
+      value={local}
+      onChange={(e) => setLocal(e.target.value)}
+      onBlur={() => { if (local !== (value ?? '')) onCommit(local); }}
+      onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+      className={className}
+      {...props}
+    />
+  );
+}
+
 function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, soloLectura, onAgregarFila, onEditarFila, onEliminarFila, onLimpiar, onEliminarProfesional }) {
-  const totalHrs = bloques.reduce((s, b) => s + b.duracionMin / 60, 0);
-  const totalCupos = bloques.reduce((s, b) => s + (b.rendimiento || 0) * (b.duracionMin / 60), 0);
-  const filas = bloques.slice().sort((a, b) => DIAS.indexOf(a.dia) - DIAS.indexOf(b.dia) || a.inicioMin - b.inicioMin);
+  const [filtroDia, setFiltroDia] = useState('todos');
+  const [filtroProceso, setFiltroProceso] = useState('todos');
+  const [filtroPrestacion, setFiltroPrestacion] = useState('todos');
+  const [filtroBox, setFiltroBox] = useState('todos');
+  const [busqueda, setBusqueda] = useState('');
+
+  const diasPresentes = DIAS.filter((d) => bloques.some((b) => b.dia === d));
+  const procesosPresentes = Array.from(new Set(bloques.map((b) => b.proceso).filter(Boolean))).sort();
+  const prestacionesPresentes = Array.from(new Set(bloques.map((b) => b.actividad).filter(Boolean))).sort();
+  const boxesPresentes = Array.from(new Set(bloques.map((b) => b.box).filter(Boolean))).sort();
+  const filtroActivo = filtroDia !== 'todos' || filtroProceso !== 'todos' || filtroPrestacion !== 'todos' || filtroBox !== 'todos' || busqueda.trim() !== '';
+
+  const filas = bloques
+    .slice()
+    .sort((a, b) => DIAS.indexOf(a.dia) - DIAS.indexOf(b.dia) || a.inicioMin - b.inicioMin)
+    .filter((b) => filtroDia === 'todos' || b.dia === filtroDia)
+    .filter((b) => filtroProceso === 'todos' || b.proceso === filtroProceso)
+    .filter((b) => filtroPrestacion === 'todos' || b.actividad === filtroPrestacion)
+    .filter((b) => filtroBox === 'todos' || b.box === filtroBox)
+    .filter((b) => {
+      const q = busqueda.trim().toLowerCase();
+      if (!q) return true;
+      return (b.observaciones || '').toLowerCase().includes(q);
+    });
+  const filasJornada = filas.filter((b) => !b.esTurno);
+  const totalHrs = filasJornada.reduce((s, b) => s + b.duracionMin / 60, 0);
+  const totalCupos = filasJornada.reduce((s, b) => s + (b.tieneRendimiento ? Math.round((b.rendimiento || 0) * (b.duracionMin / 60)) : 0), 0);
+  const totalHrsTurno = filas.filter((b) => b.esTurno).reduce((s, b) => s + b.duracionMin / 60, 0);
   const [opciones, setOpciones] = useState([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const wrapperRef = useRef(null);
@@ -2549,42 +2709,87 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
         </div>
       )}
 
+      <div className="flex flex-wrap items-center gap-2 mb-2.5">
+        <select value={filtroDia} onChange={(e) => setFiltroDia(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white">
+          <option value="todos">Todos los días</option>
+          {diasPresentes.map((d) => <option key={d} value={d}>{d}</option>)}
+        </select>
+        <select value={filtroProceso} onChange={(e) => setFiltroProceso(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white">
+          <option value="todos">Todos los procesos</option>
+          {procesosPresentes.map((p) => <option key={p} value={p}>{p}</option>)}
+        </select>
+        <select value={filtroPrestacion} onChange={(e) => setFiltroPrestacion(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white max-w-[220px]">
+          <option value="todos">Todas las prestaciones</option>
+          {prestacionesPresentes.map((p) => <option key={p} value={p}>{p}</option>)}
+        </select>
+        <select value={filtroBox} onChange={(e) => setFiltroBox(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white">
+          <option value="todos">Todos los box</option>
+          {boxesPresentes.map((b) => <option key={b} value={b}>{b}</option>)}
+        </select>
+        <input
+          type="text"
+          value={busqueda}
+          onChange={(e) => setBusqueda(e.target.value)}
+          placeholder="Buscar en observaciones..."
+          className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white w-52"
+        />
+        {filtroActivo && (
+          <button
+            onClick={() => { setFiltroDia('todos'); setFiltroProceso('todos'); setFiltroPrestacion('todos'); setFiltroBox('todos'); setBusqueda(''); }}
+            className="text-xs text-[#4C7C74] hover:underline"
+          >
+            Limpiar filtros
+          </button>
+        )}
+      </div>
+
       <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
         <div ref={wrapperRef} className="relative" onMouseMove={handleMouseMove} onMouseLeave={() => setInsertPos(null)}>
-          <table className="w-full text-xs min-w-[680px]">
+          <table className="w-full text-xs min-w-[980px]">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
                 <th className="text-left px-2.5 py-2 font-medium">Día</th>
                 <th className="text-left px-2.5 py-2 font-medium">Hora inicio</th>
                 <th className="text-left px-2.5 py-2 font-medium">Hora término</th>
                 <th className="text-left px-2.5 py-2 font-medium">Prestación</th>
-                <th className="text-right px-2.5 py-2 font-medium">Rendimiento (at/hr)</th>
-                <th className="text-right px-2.5 py-2 font-medium">Cupos est.</th>
+                <th className="text-left px-2.5 py-2 font-medium">Proceso</th>
+                <th className="text-left px-2.5 py-2 font-medium">Box</th>
+                <th className="text-right px-2.5 py-2 font-medium">Cupos</th>
+                <th className="text-right px-2.5 py-2 font-medium">Duración</th>
+                <th className="text-left px-2.5 py-2 font-medium">Observaciones</th>
+                <th className="text-center px-2.5 py-2 font-medium">Turno</th>
                 {!soloLectura && <th className="w-10 text-center font-medium">Borrar</th>}
               </tr>
             </thead>
             <tbody ref={bodyRef}>
               {filas.length === 0 && (
-                <tr><td colSpan={soloLectura ? 6 : 7} className="px-2.5 py-6 text-center text-slate-400 italic">
-                  {soloLectura ? 'Sin actividades cargadas.' : 'Sin actividades cargadas. Mueve el mouse sobre esta área y haz clic para agregar la primera.'}
+                <tr><td colSpan={soloLectura ? 10 : 11} className="px-2.5 py-6 text-center text-slate-400 italic">
+                  {filtroActivo
+                    ? 'Ningún bloque coincide con los filtros aplicados.'
+                    : soloLectura ? 'Sin actividades cargadas.' : 'Sin actividades cargadas. Mueve el mouse sobre esta área y haz clic para agregar la primera.'}
                 </td></tr>
               )}
               {filas.map((b) => {
-                const cupos = b.tieneRendimiento ? Math.round((b.rendimiento || 0) * (b.duracionMin / 60) * 10) / 10 : null;
+                const cupos = b.tieneRendimiento ? Math.round((b.rendimiento || 0) * (b.duracionMin / 60)) : null;
+                const duracionPorCupo = cupos ? Math.round((b.duracionMin / cupos) * 10) / 10 : null;
                 if (soloLectura) {
                   return (
-                    <tr key={b.id} data-fila className="border-t border-slate-100">
+                    <tr key={b.id} data-fila className="border-t border-slate-100" style={b.esTurno ? { background: '#FDF6EC' } : undefined}>
                       <td className="px-2.5 py-1.5 text-slate-600">{b.dia}</td>
                       <td className="px-2.5 py-1.5 text-slate-600">{hhmmDesdeMin(b.inicioMin)}</td>
                       <td className="px-2.5 py-1.5 text-slate-600">{hhmmDesdeMin(b.inicioMin + b.duracionMin)}</td>
                       <td className="px-2.5 py-1.5" style={{ color: b.proceso ? COLOR_PROCESO[b.proceso] : '#94a3b8' }}>{b.actividad || '—'}</td>
-                      <td className="px-2.5 py-1.5 text-right text-slate-600">{b.tieneRendimiento ? (b.rendimiento ?? 0) : 'N/A'}</td>
-                      <td className="px-2.5 py-1.5 text-right text-slate-600 font-medium">{cupos === null ? '—' : cupos}</td>
+                      <td className="px-2.5 py-1.5 text-slate-600">{b.proceso || '—'}</td>
+                      <td className="px-2.5 py-1.5 text-slate-600">{b.box || '—'}</td>
+                      <td className="px-2.5 py-1.5 text-right text-slate-600 font-medium">{cupos === null ? 'N/A' : cupos}</td>
+                      <td className="px-2.5 py-1.5 text-right text-slate-600">{duracionPorCupo === null ? '—' : `${duracionPorCupo} min`}</td>
+                      <td className="px-2.5 py-1.5 text-slate-600">{b.observaciones || '—'}</td>
+                      <td className="px-2.5 py-1.5 text-center">{b.esTurno && <span className="text-[10px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full">Turno</span>}</td>
                     </tr>
                   );
                 }
                 return (
-                  <tr key={b.id} data-fila className="border-t border-slate-100 hover:bg-slate-50/60">
+                  <tr key={b.id} data-fila className="border-t border-slate-100 hover:bg-slate-50/60" style={b.esTurno ? { background: '#FDF6EC' } : undefined}>
                     <td className="px-1 py-1">
                       <select value={b.dia} onChange={(e) => onEditarFila(b.id, { dia: e.target.value })} className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-full">
                         {DIAS.map((d) => <option key={d} value={d}>{d}</option>)}
@@ -2631,7 +2836,10 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                         style={{ color: b.proceso ? COLOR_PROCESO[b.proceso] : '#94a3b8' }}
                       >
                         {!b.proceso && <option value="">— Selecciona prestación —</option>}
-                        {PROCESOS_CAT.filter((p) => opciones.some((o) => o.proceso === p)).map((proceso) => (
+                        {[
+                          ...PROCESOS_CAT.filter((p) => opciones.some((o) => o.proceso === p)),
+                          ...Array.from(new Set(opciones.map((o) => o.proceso))).filter((p) => !PROCESOS_CAT.includes(p)),
+                        ].map((proceso) => (
                           <optgroup key={proceso} label={proceso}>
                             {opciones.filter((o) => o.proceso === proceso).map((o) => (
                               <option key={o.actividad} value={`${o.proceso}|||${o.actividad}`}>{o.actividad}</option>
@@ -2641,23 +2849,73 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                       </select>
                     </td>
                     <td className="px-1 py-1">
-                      {b.tieneRendimiento ? (() => {
-                        const ref = rendimientoSugeridoMinsal(profesional.tipo, especialidad, b.actividad);
+                      {(() => {
+                        const procesosValidos = Array.from(new Set(opciones.filter((o) => o.actividad === b.actividad).map((o) => o.proceso)));
+                        if (!b.actividad || procesosValidos.length === 0) {
+                          return <div className="text-xs text-slate-300 px-1 py-1">—</div>;
+                        }
                         return (
-                          <input
-                            type="number" min={0} step={0.1}
-                            value={b.rendimiento ?? 0}
-                            onChange={(e) => onEditarFila(b.id, { rendimiento: Number(e.target.value) })}
-                            title={ref != null ? `Referencia oficial: ${ref} at/hr (estándar local Servicio de Salud Coquimbo, Ord. N°0214)` : undefined}
-                            className="text-xs text-right bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-16"
-                            style={ref != null ? { boxShadow: 'inset 0 0 0 1px #C9E0D8' } : undefined}
-                          />
+                          <select
+                            value={b.proceso || ''}
+                            onChange={(e) => {
+                              const nuevoProceso = e.target.value;
+                              const item = opciones.find((o) => o.proceso === nuevoProceso && o.actividad === b.actividad);
+                              onEditarFila(b.id, {
+                                proceso: nuevoProceso,
+                                clinica: item ? item.clinica : b.clinica,
+                                tieneRendimiento: item ? item.tieneRendimiento : false,
+                                rendimiento: item && item.tieneRendimiento ? b.rendimiento : 0,
+                              });
+                            }}
+                            className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-full"
+                            style={{ color: b.proceso ? COLOR_PROCESO[b.proceso] : '#94a3b8' }}
+                          >
+                            {procesosValidos.map((p) => <option key={p} value={p}>{p}</option>)}
+                          </select>
                         );
-                      })() : (
+                      })()}
+                    </td>
+                    <td className="px-1 py-1">
+                      <EditableText
+                        value={b.box || ''}
+                        onCommit={(v) => onEditarFila(b.id, { box: v })}
+                        placeholder="—"
+                        className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-16"
+                      />
+                    </td>
+                    <td className="px-1 py-1">
+                      {b.tieneRendimiento ? (
+                        <EditableText
+                          type="number" min={0} step={1}
+                          value={cupos ?? 0}
+                          onCommit={(v) => {
+                            const nuevoCupos = Math.max(0, Math.round(Number(v) || 0));
+                            const nuevoRendimiento = b.duracionMin > 0 ? Math.round((nuevoCupos * 60 / b.duracionMin) * 100) / 100 : 0;
+                            onEditarFila(b.id, { rendimiento: nuevoRendimiento });
+                          }}
+                          className="text-xs text-right bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-16"
+                        />
+                      ) : (
                         <div className="text-xs text-slate-300 text-right pr-1">N/A</div>
                       )}
                     </td>
-                    <td className="px-2.5 py-1 text-right text-slate-600 font-medium">{cupos === null ? '—' : cupos}</td>
+                    <td className="px-2.5 py-1 text-right text-slate-600 font-medium">{duracionPorCupo === null ? '—' : `${duracionPorCupo} min`}</td>
+                    <td className="px-1 py-1">
+                      <EditableText
+                        value={b.observaciones || ''}
+                        onCommit={(v) => onEditarFila(b.id, { observaciones: v })}
+                        placeholder="—"
+                        className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-full min-w-[120px]"
+                      />
+                    </td>
+                    <td className="text-center px-1 py-1">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(b.esTurno)}
+                        onChange={(e) => onEditarFila(b.id, { esTurno: e.target.checked })}
+                        title="Es un bloque de turno (Art. 15) — no cuenta como horas de jornada"
+                      />
+                    </td>
                     <td className="text-center">
                       <button
                         onClick={() => onEliminarFila(b.id)}
@@ -2675,8 +2933,10 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
             {filas.length > 0 && (
               <tfoot className="bg-slate-50 border-t border-slate-200">
                 <tr>
-                  <td colSpan={5} className="px-2.5 py-2 text-right text-slate-500 font-medium">Totales</td>
-                  <td className="px-2.5 py-2 text-right font-semibold text-slate-700">{totalCupos.toFixed(1)}</td>
+                  <td colSpan={6} className="px-2.5 py-2 text-right text-slate-500 font-medium">Totales</td>
+                  <td className="px-2.5 py-2 text-right font-semibold text-slate-700">{totalCupos}</td>
+                  <td></td>
+                  <td></td>
                   {!soloLectura && <td></td>}
                 </tr>
               </tfoot>
@@ -2697,7 +2957,10 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
           )}
         </div>
       </div>
-      <div className="text-[11px] text-slate-400 mt-2">Total horas programadas: {totalHrs.toFixed(1)} hrs</div>
+      <div className="text-[11px] text-slate-400 mt-2">
+        {filtroActivo ? 'Total horas (filtrado)' : 'Total horas de jornada'}: {totalHrs.toFixed(1)} hrs
+        {totalHrsTurno > 0 && <> · Turno: {totalHrsTurno.toFixed(1)} hrs</>}
+      </div>
     </div>
   );
 }
@@ -2711,7 +2974,7 @@ function ResumenProfesionalPanel({ bloques }) {
   const totalHrs = totalHorasAgenda(horas);
   const porProceso = PROCESOS_CAT.map((p) => ({ proceso: p, horas: horas[p] || 0 }));
   const dist = distribucionDesdeBloquesProf(bloques);
-  const cuposSemanales = bloques.reduce((s, b) => s + (b.rendimiento || 0) * (b.duracionMin / 60), 0);
+  const cuposSemanales = bloques.filter((b) => !b.esTurno).reduce((s, b) => s + (b.rendimiento || 0) * (b.duracionMin / 60), 0);
   const produccionAnualBruta = cuposSemanales * SEMANAS_POR_ANIO;
   const produccionAnualNeta = produccionAnualBruta * (1 - AUSENTISMO_PCT / 100);
 
@@ -2781,11 +3044,1104 @@ function ResumenProfesionalPanel({ bloques }) {
   );
 }
 
-function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especialidad, profesionales, bloques, onDescartar, onGuardarBorrador, onCerrar, onEnviar, onAgregarProfesional, onEliminarProfesional, onRenombrarProfesional, onLimpiarProfesional, onAgregarBloque, onEditarBloque, onEliminarBloque }) {
+function cuposBloque(b) {
+  return b.tieneRendimiento ? Math.round((b.rendimiento || 0) * (b.duracionMin / 60)) : 0;
+}
+
+// Clasificación por texto de la prestación: contiene "Nueva" o "Control" (consultas presenciales, telemedicina, etc.)
+// El % Consulta Nueva solo considera prestaciones presenciales — se excluye cualquier
+// telemedicina/teleconsulta/contacto telefónico (todas contienen "tele" en el nombre).
+function esPrestacionPresencial(actividad) {
+  return !/tele/i.test(actividad || '');
+}
+function esConsultaNueva(actividad) {
+  return /nueva/i.test(actividad || '') && esPrestacionPresencial(actividad);
+}
+function esConsultaControl(actividad) {
+  return /control/i.test(actividad || '') && esPrestacionPresencial(actividad);
+}
+
+// Horas, cupos y rendimiento (cupos/hora) logrado por cada prestación que sí lleva rendimiento
+function rendimientoPorPrestacion(bloques) {
+  const map = {};
+  bloques.forEach((b) => {
+    if (!b.tieneRendimiento) return;
+    const key = `${b.proceso}|||${b.actividad}`;
+    if (!map[key]) map[key] = { proceso: b.proceso, actividad: b.actividad, horas: 0, cupos: 0 };
+    map[key].horas += b.duracionMin / 60;
+    map[key].cupos += cuposBloque(b);
+  });
+  return Object.values(map)
+    .map((item) => ({
+      ...item,
+      horas: Math.round(item.horas * 10) / 10,
+      rendimiento: item.horas > 0 ? Math.round((item.cupos / item.horas) * 100) / 100 : 0,
+    }))
+    .sort((a, b) => b.horas - a.horas);
+}
+
+function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesTodosRaw, proyeccionTurno }) {
+  const [seleccion, setSeleccion] = useState([]); // [{ proceso, actividad }] — se pueden combinar varias prestaciones
+  const [filtroBecados, setFiltroBecados] = useState('todos'); // 'todos' | 'sin' | 'solo'
+  const [filtroTipoProfesional, setFiltroTipoProfesional] = useState('todos');
+  const [filtroProfesional, setFiltroProfesional] = useState('todos');
+  const [verHorasEfectivas, setVerHorasEfectivas] = useState(false);
+  const hayProyeccionTurno = Array.isArray(proyeccionTurno) && proyeccionTurno.length > 0;
+  const proyeccionPorNombre = new Map(
+    (proyeccionTurno || []).map((p) => [p.professionalName.trim().toLowerCase(), p])
+  );
+
+  // Mapa profesional(id público)+día+horario -> minutos que en promedio se pierden por semana
+  // ese bloque específico al cruzarse con turno (Art. 15) real este mes. Se usa para, cuando el
+  // usuario activa "horas efectivas", ajustar la duración de cada bloque ANTES de que corra
+  // cualquier cálculo derivado (horas, cupos, heatmap, gráficos) — así el toggle afecta todo el
+  // resumen de forma consistente en vez de ser un número aparte solo para una tabla.
+  const perdidaPorBloqueMap = new Map();
+  if (hayProyeccionTurno) {
+    profesionalesTodos.forEach((p) => {
+      const cruce = proyeccionPorNombre.get((p.nombre || '').trim().toLowerCase());
+      (cruce?.perdidaPorBloque || []).forEach((pb) => {
+        perdidaPorBloqueMap.set(`${p.id}|||${pb.dia}|||${pb.inicioMin}`, pb.minutosPerdidosPromedioSemanal);
+      });
+    });
+  }
+  const activarHorasEfectivas = verHorasEfectivas && hayProyeccionTurno;
+  const bloquesTodos = activarHorasEfectivas
+    ? bloquesTodosRaw.map((b) => {
+        if (b.esTurno) return b;
+        const minutosPerdidos = perdidaPorBloqueMap.get(`${b.profesionalId}|||${b.dia}|||${b.inicioMin}`);
+        if (!minutosPerdidos) return b;
+        return { ...b, duracionMin: Math.max(0, b.duracionMin - minutosPerdidos) };
+      })
+    : bloquesTodosRaw;
+
+  const hayBecados = profesionalesTodos.some((p) => p.nivelFormacion);
+  const tiposProfesional = Array.from(new Set(profesionalesTodos.map((p) => p.tipo || 'Sin tipo'))).sort();
+  const profesionales = profesionalesTodos.filter((p) => {
+    if (filtroBecados !== 'todos' && (filtroBecados === 'solo' ? !p.nivelFormacion : p.nivelFormacion)) return false;
+    if (filtroTipoProfesional !== 'todos' && (p.tipo || 'Sin tipo') !== filtroTipoProfesional) return false;
+    if (filtroProfesional !== 'todos' && p.id !== filtroProfesional) return false;
+    return true;
+  });
+  const idsFiltrados = new Set(profesionales.map((p) => p.id));
+  const sinFiltrosActivos = filtroBecados === 'todos' && filtroTipoProfesional === 'todos' && filtroProfesional === 'todos';
+  const bloques = sinFiltrosActivos
+    ? bloquesTodos
+    : bloquesTodos.filter((b) => idsFiltrados.has(b.profesionalId));
+  const horas = horasDesdeBloquesProf(bloques);
+  const totalHrs = totalHorasAgenda(horas);
+  const porProceso = PROCESOS_CAT.map((p) => ({ proceso: p, horas: horas[p] || 0 }));
+  const porTrazadora = horasPorActividadYProceso(bloques).slice(0, 12);
+  const bloquesDistribucion = seleccion.length > 0
+    ? bloques.filter((b) => seleccion.some((s) => s.proceso === b.proceso && s.actividad === b.actividad))
+    : bloques;
+  const distribucionAgregada = distribucionDesdeBloquesProf(bloquesDistribucion);
+  const paralelosPorBloque = paralelosDesdeBloquesProf(bloquesDistribucion);
+  const totalCupos = bloques.reduce((s, b) => s + cuposBloque(b), 0);
+
+  const cuposNuevas = bloques.filter((b) => esConsultaNueva(b.actividad)).reduce((s, b) => s + cuposBloque(b), 0);
+  const cuposControles = bloques.filter((b) => esConsultaControl(b.actividad)).reduce((s, b) => s + cuposBloque(b), 0);
+  const pctConsultaNueva = cuposNuevas + cuposControles > 0 ? Math.round((cuposNuevas / (cuposNuevas + cuposControles)) * 100) : null;
+
+  const rendimientoPrestaciones = rendimientoPorPrestacion(bloques);
+
+  const hayTurno = bloques.some((b) => b.esTurno);
+  const porProfesional = profesionales
+    .map((p) => {
+      const bp = bloques.filter((b) => b.profesionalId === p.id);
+      const bpJornada = bp.filter((b) => !b.esTurno);
+      return {
+        ...p,
+        horas: bpJornada.reduce((s, b) => s + b.duracionMin / 60, 0),
+        cupos: bpJornada.reduce((s, b) => s + cuposBloque(b), 0),
+        horasTurno: bp.filter((b) => b.esTurno).reduce((s, b) => s + b.duracionMin / 60, 0),
+        bloques: bp.length,
+      };
+    })
+    .sort((a, b) => b.horas - a.horas);
+
+  // Cuánto se pierde por semana (promedio del mes en curso) solo dentro del conjunto ya
+  // filtrado, para que el aviso arriba del resumen sea coherente con los filtros de profesional
+  // que el usuario tenga activos.
+  const totalHorasPerdidasSemanales = activarHorasEfectivas
+    ? bloques.reduce((s, b) => {
+        if (b.esTurno) return s;
+        const minutosPerdidos = perdidaPorBloqueMap.get(`${b.profesionalId}|||${b.dia}|||${b.inicioMin}`) || 0;
+        return s + minutosPerdidos / 60;
+      }, 0)
+    : 0;
+
+  return (
+    <div className="space-y-5">
+      {hayProyeccionTurno && (
+        <div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] text-slate-500">Todo este resumen (horas, cupos, gráficos y heatmap):</span>
+            <button
+              onClick={() => setVerHorasEfectivas((v) => !v)}
+              className={`text-xs px-2.5 py-1 rounded-full border ${verHorasEfectivas ? 'bg-[#B6522F] text-white border-[#B6522F]' : 'bg-white text-slate-500 border-slate-300 hover:border-slate-400'}`}
+            >
+              {verHorasEfectivas ? 'Viendo horas efectivas (cruzadas con turno)' : 'Ver horas efectivas (cruzadas con turno)'}
+            </button>
+          </div>
+          {activarHorasEfectivas && (
+            <div className="text-[11px] text-slate-500 bg-[#FBEEE8] border border-[#F2D9CC] rounded-lg px-3 py-2 mt-2">
+              Jornada (Art. 19) cruzada contra el turno (Art. 15) real del mes en curso: cada bloque que se superpone con un turno queda con su duración reducida por el promedio semanal de horas perdidas, y esa reducción se propaga a horas, cupos, % consulta nueva, producción anual y el heatmap de abajo. Total perdido este mes en el conjunto filtrado: <strong>{totalHorasPerdidasSemanales.toFixed(1)} hrs/semana</strong>.
+            </div>
+          )}
+        </div>
+      )}
+      {(hayBecados || tiposProfesional.length > 1 || profesionalesTodos.length > 1) && (
+        <div className="flex items-center gap-2 flex-wrap">
+          {hayBecados && (
+            <>
+              <span className="text-[11px] text-slate-500">Profesionales:</span>
+              {[
+                { value: 'todos', label: 'Todos' },
+                { value: 'sin', label: 'Sin becados' },
+                { value: 'solo', label: 'Solo becados' },
+              ].map((opt) => (
+                <button
+                  key={opt.value}
+                  onClick={() => setFiltroBecados(opt.value)}
+                  className={`text-xs px-2.5 py-1 rounded-full border ${filtroBecados === opt.value ? 'bg-[#4C7C74] text-white border-[#4C7C74]' : 'bg-white text-slate-500 border-slate-300 hover:border-slate-400'}`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </>
+          )}
+          {tiposProfesional.length > 1 && (
+            <select
+              value={filtroTipoProfesional}
+              onChange={(e) => setFiltroTipoProfesional(e.target.value)}
+              className="text-xs rounded-lg border border-slate-300 px-2.5 py-1.5 bg-white"
+            >
+              <option value="todos">Todos los tipos de profesional</option>
+              {tiposProfesional.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          )}
+          {profesionalesTodos.length > 1 && (
+            <select
+              value={filtroProfesional}
+              onChange={(e) => setFiltroProfesional(e.target.value)}
+              className="text-xs rounded-lg border border-slate-300 px-2.5 py-1.5 bg-white"
+            >
+              <option value="todos">Todos los profesionales</option>
+              {profesionalesTodos.slice().sort((a, b) => a.nombre.localeCompare(b.nombre)).map((p) => (
+                <option key={p.id} value={p.id}>{p.nombre}</option>
+              ))}
+            </select>
+          )}
+        </div>
+      )}
+
+      <div className="grid grid-cols-5 gap-3">
+        {[
+          { label: 'Profesionales', value: profesionales.length },
+          { label: activarHorasEfectivas ? 'Horas efectivas' : 'Horas programadas', value: totalHrs.toFixed(1) },
+          { label: activarHorasEfectivas ? 'Cupos efectivos' : 'Cupos semanales', value: totalCupos },
+          { label: 'Bloques', value: bloques.length },
+        ].map((s) => (
+          <div key={s.label} className="bg-white rounded-xl border border-slate-200 p-3">
+            <div className="text-[11px] text-slate-500">{s.label}</div>
+            <div className="text-xl font-semibold text-slate-800 mt-0.5">{s.value}</div>
+          </div>
+        ))}
+        <div className="bg-white rounded-xl border border-slate-200 p-3">
+          <div className="text-[11px] text-slate-500">% Consulta Nueva</div>
+          <div className="text-xl font-semibold text-slate-800 mt-0.5">{pctConsultaNueva === null ? '—' : `${pctConsultaNueva}%`}</div>
+          <div className="text-[10px] text-slate-400 mt-0.5">{cuposNuevas} nuevas / {cuposControles} controles</div>
+        </div>
+      </div>
+
+      <div>
+        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Horas por proceso</div>
+        <div className="bg-white rounded-xl border border-slate-200 p-3" style={{ height: 200 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={porProceso} margin={{ top: 20, right: 10, left: -20, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
+              <XAxis dataKey="proceso" tick={{ fontSize: 9 }} interval={0} />
+              <YAxis tick={{ fontSize: 10 }} />
+              <Tooltip formatter={(value) => [`${value.toFixed(1)} hrs`, 'Horas']} />
+              <Bar dataKey="horas" fill="#4C7C74" radius={[4, 4, 0, 0]}>
+                <LabelList
+                  dataKey="horas"
+                  position="top"
+                  style={{ fontSize: 9, fill: '#475569' }}
+                  formatter={(value) => (totalHrs > 0 ? `${Math.round((value / totalHrs) * 100)}%` : '')}
+                />
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div>
+        <div className="flex items-center justify-between mb-1 flex-wrap gap-1">
+          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Horas por prestación (top 12)</div>
+          <div className="text-[11px] text-slate-400">Haz clic en una o varias barras para combinarlas en la distribución horaria</div>
+        </div>
+        <div className="flex flex-wrap gap-3 mb-2">
+          {PROCESOS_CAT.map((p) => (
+            <div key={p} className="flex items-center gap-1">
+              <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: COLOR_PROCESO[p] }} />
+              <span className="text-[10px] text-slate-500">{p}</span>
+            </div>
+          ))}
+        </div>
+        <div className="bg-white rounded-xl border border-slate-200 p-3" style={{ height: Math.max(280, porTrazadora.length * 34) }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={porTrazadora} layout="vertical" margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
+              <XAxis type="number" tick={{ fontSize: 9 }} />
+              <YAxis type="category" dataKey="actividad" tick={{ fontSize: 9 }} width={150} interval={0} />
+              <Tooltip formatter={(value, _name, item) => [`${value} hrs`, item.payload.proceso]} />
+              <Bar
+                dataKey="horas"
+                radius={[0, 4, 4, 0]}
+                cursor="pointer"
+                onClick={(data) => setSeleccion((prev) => {
+                  const yaEsta = prev.some((s) => s.proceso === data.proceso && s.actividad === data.actividad);
+                  return yaEsta
+                    ? prev.filter((s) => !(s.proceso === data.proceso && s.actividad === data.actividad))
+                    : [...prev, { proceso: data.proceso, actividad: data.actividad }];
+                })}
+              >
+                {porTrazadora.map((entry) => (
+                  <Cell
+                    key={`${entry.proceso}|||${entry.actividad}`}
+                    fill={seleccion.length === 0 || seleccion.some((s) => s.proceso === entry.proceso && s.actividad === entry.actividad) ? COLOR_PROCESO[entry.proceso] : '#E2E8F0'}
+                  />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div>
+        <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
+          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+            Distribución horaria{seleccion.length > 0 ? ` — ${seleccion.length === 1 ? `${seleccion[0].actividad} (${seleccion[0].proceso})` : `${seleccion.length} prestaciones seleccionadas`}` : ' de la agenda'}
+          </div>
+          {seleccion.length > 0 && (
+            <button onClick={() => setSeleccion([])} className="text-[11px] text-[#4C7C74] hover:underline">
+              Ver todas las prestaciones
+            </button>
+          )}
+        </div>
+        <div className="bg-white rounded-xl border border-slate-200 p-3 overflow-x-auto">
+          <div style={{ display: 'grid', gridTemplateColumns: `40px repeat(${DIAS.length}, 34px)`, gap: 3, width: 'max-content' }}>
+            <div />
+            {DIAS.map((dia) => (
+              <div key={dia} className="text-[10px] text-slate-600 font-medium text-center">{dia.slice(0, 3)}</div>
+            ))}
+            {BLOQUES.map((b) => (
+              <React.Fragment key={b}>
+                <div className="text-[8px] text-slate-400 flex items-center justify-end pr-1">{b.slice(3, 5) === '00' ? b.slice(0, 2) : ''}</div>
+                {DIAS.map((dia) => {
+                  const horasProgramadas = distribucionAgregada[dia][b];
+                  const capacidad = INFRAESTRUCTURA_CAPACIDAD[dia][b];
+                  const pct = capacidad > 0 ? (horasProgramadas / capacidad) * 100 : (horasProgramadas > 0 ? 999 : 0);
+                  const color = heatColor(pct);
+                  const paralelos = paralelosPorBloque[dia][b];
+                  return (
+                    <div
+                      key={dia}
+                      title={`${dia} ${b} — ${horasProgramadas.toFixed(1)} / ${capacidad} hrs (${capacidad > 0 ? pct.toFixed(0) + '%' : 'sin capacidad'}) · ${paralelos} profesional${paralelos === 1 ? '' : 'es'} en paralelo`}
+                      style={{ background: color.bg, height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                    >
+                      {paralelos > 0 && (
+                        <span style={{ color: color.text, fontSize: 9, fontWeight: 600 }}>{paralelos}</span>
+                      )}
+                    </div>
+                  );
+                })}
+              </React.Fragment>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 mt-3 px-1 max-w-xs">
+            <span className="text-[10px] text-slate-400">0%</span>
+            <div className="flex-1 h-2.5 rounded-full" style={{ background: 'linear-gradient(to right, hsl(165,62%,88%), hsl(82,62%,64%), hsl(41,62%,52%), hsl(0,62%,40%))' }} />
+            <span className="text-[10px] text-slate-400">≥130%</span>
+          </div>
+        </div>
+        <div className="text-[11px] text-slate-400 mt-1.5">Color = % de uso respecto a la capacidad de infraestructura (boxes/pabellones) disponible por día y bloque de 30 min. El número en cada celda es la cantidad de profesionales en paralelo. Pasa el mouse sobre una celda para ver el detalle.</div>
+      </div>
+
+      <div>
+        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+          Detalle por profesional{activarHorasEfectivas ? ' (horas efectivas)' : ''}
+        </div>
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-50 text-slate-500">
+              <tr>
+                <th className="text-left px-3 py-2 font-medium">Profesional</th>
+                <th className="text-left px-3 py-2 font-medium">Tipo</th>
+                <th className="text-left px-3 py-2 font-medium">Nivel</th>
+                <th className="text-right px-3 py-2 font-medium">Horas{activarHorasEfectivas ? ' efectivas' : ''}</th>
+                {hayTurno && <th className="text-right px-3 py-2 font-medium">Horas turno</th>}
+                <th className="text-right px-3 py-2 font-medium">Cupos</th>
+                <th className="text-right px-3 py-2 font-medium">Bloques</th>
+              </tr>
+            </thead>
+            <tbody>
+              {porProfesional.map((p) => (
+                <tr key={p.id} className="border-t border-slate-100">
+                  <td className="px-3 py-1.5 text-slate-700">{p.nombre}</td>
+                  <td className="px-3 py-1.5 text-slate-500">{p.tipo || 'Sin tipo'}</td>
+                  <td className="px-3 py-1.5">
+                    {p.nivelFormacion && (
+                      <span className="inline-block text-[10px] font-semibold text-[#7A5CC7] bg-[#F1EDFB] px-1.5 py-0.5 rounded-full">{p.nivelFormacion}</span>
+                    )}
+                    {p.esSoloTurno ? (
+                      <span className="inline-block text-[10px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full ml-1">Solo turno</span>
+                    ) : p.tieneTurno && (
+                      <span className="inline-block text-[10px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full ml-1">Turno</span>
+                    )}
+                  </td>
+                  <td className={`px-3 py-1.5 text-right ${activarHorasEfectivas ? 'font-medium text-[#B6522F]' : 'text-slate-600'}`}>{p.horas.toFixed(1)}</td>
+                  {hayTurno && <td className="px-3 py-1.5 text-right text-slate-600">{p.horasTurno > 0 ? p.horasTurno.toFixed(1) : '—'}</td>}
+                  <td className="px-3 py-1.5 text-right text-slate-600">{p.cupos}</td>
+                  <td className="px-3 py-1.5 text-right text-slate-600">{p.bloques}</td>
+                </tr>
+              ))}
+              {porProfesional.length === 0 && (
+                <tr><td colSpan={hayTurno ? 7 : 6} className="px-3 py-6 text-center text-slate-400 italic">Sin profesionales cargados en esta agenda.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Rendimiento por prestación</div>
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-50 text-slate-500">
+              <tr>
+                <th className="text-left px-3 py-2 font-medium">Prestación</th>
+                <th className="text-left px-3 py-2 font-medium">Proceso</th>
+                <th className="text-right px-3 py-2 font-medium">Horas</th>
+                <th className="text-right px-3 py-2 font-medium">Cupos</th>
+                <th className="text-right px-3 py-2 font-medium">Rendimiento (at/hr)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rendimientoPrestaciones.map((r) => (
+                <tr key={`${r.proceso}|||${r.actividad}`} className="border-t border-slate-100">
+                  <td className="px-3 py-1.5 text-slate-700">{r.actividad}</td>
+                  <td className="px-3 py-1.5" style={{ color: COLOR_PROCESO[r.proceso] }}>{r.proceso}</td>
+                  <td className="px-3 py-1.5 text-right text-slate-600">{r.horas.toFixed(1)}</td>
+                  <td className="px-3 py-1.5 text-right text-slate-600">{r.cupos}</td>
+                  <td className="px-3 py-1.5 text-right text-slate-600 font-medium">{r.rendimiento.toFixed(2)}</td>
+                </tr>
+              ))}
+              {rendimientoPrestaciones.length === 0 && (
+                <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400 italic">Sin prestaciones con rendimiento cargadas en esta agenda.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="text-[11px] text-slate-400 mt-1.5">Solo incluye prestaciones que llevan cupos/rendimiento. Rendimiento = cupos totales ÷ horas totales de esa prestación.</div>
+      </div>
+    </div>
+  );
+}
+
+// Muestra la rotación de turno (Art. 15) de un servicio: se calcula sola a partir del orden
+// de personas + fecha ancla de cada rotación, no depende de que se haya cargado una tabla para
+// el mes que se está mirando. No se mezcla con las horas de jornada (Art. 19) — son dos datos
+// separados para que el jefe de servicio los cruce manualmente, como ya hace hoy.
+const PUESTO_COLORES = ['#4C7C74', '#7A5CC7', '#B6522F', '#3B6FA0', '#0F6E56'];
+
+function primerDiaMes(date) {
+  return new Date(date.getFullYear(), date.getMonth(), 1);
+}
+function fechaISO(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+// Semana empieza en lunes: convierte getDay() (0=domingo) a 0=lunes..6=domingo.
+function diaSemanaLunesPrimero(date) {
+  return (date.getDay() + 6) % 7;
+}
+
+// Crea o edita una ShiftRotation: unidad, puesto, ciclo de días y la secuencia ordenada de
+// profesionales del ciclo. Un profesional nuevo (que no está en la agenda todavía) se crea al
+// guardar como "solo turno" (sin bloques de jornada), reusando el endpoint normal de crear
+// profesional — por eso requiere que la agenda esté editable (borrador/rechazada) para dar de
+// alta gente nueva; con profesionales ya existentes no hay esa restricción.
+// Presets de duración del turno — cubren los dos formatos reales vistos (24h continuo, o 2x12h
+// diurno/nocturno). "startMinutes"/"durationMinutes" ya existían en el esquema desde el
+// principio; esto es lo que faltaba para poder elegirlos desde la UI en vez de asumir 24h fijo.
+const DURACION_TURNO_PRESETS = [
+  { id: '24h', label: '24 horas (08:00 → 08:00 día siguiente)', startMinutes: 480, durationMinutes: 1440 },
+  { id: '12h-dia', label: '12 horas diurno (08:00 → 20:00)', startMinutes: 480, durationMinutes: 720 },
+  { id: '12h-noche', label: '12 horas nocturno (20:00 → 08:00 día siguiente)', startMinutes: 1200, durationMinutes: 720 },
+];
+function presetDesdeRotacion(rotacion) {
+  const match = DURACION_TURNO_PRESETS.find((p) => p.startMinutes === rotacion?.startMinutes && p.durationMinutes === rotacion?.durationMinutes);
+  return match?.id || '24h';
+}
+
+function RotacionDialog({ rotacion, servicioId, agendaId, profesionales, onCancelar, onGuardado }) {
+  const [unidad, setUnidad] = useState(rotacion?.unidad || '');
+  const [puesto, setPuesto] = useState(rotacion?.puesto || '');
+  const [cycleDays, setCycleDays] = useState(rotacion?.cycleDays || 6);
+  const [anchorDate, setAnchorDate] = useState(rotacion?.anchorDate || '');
+  const [duracionTurno, setDuracionTurno] = useState(() => presetDesdeRotacion(rotacion));
+  const [afectaJornada, setAfectaJornada] = useState(rotacion?.affectsJornada ?? true);
+  const [members, setMembers] = useState(() => {
+    const base = rotacion?.members || [];
+    return Array.from({ length: rotacion?.cycleDays || 6 }, (_, i) => {
+      const m = base.find((x) => x.position === i);
+      return { professionalId: m?.professionalId || '', professionalName: m?.professionalId ? '' : (m?.professionalName || ''), esNuevo: !m?.professionalId && !!m?.professionalName };
+    });
+  });
+  const [guardando, setGuardando] = useState(false);
+  const [error, setError] = useState('');
+
+  function cambiarCycleDays(valor) {
+    const n = Math.max(1, Math.min(31, Number(valor) || 1));
+    setCycleDays(n);
+    setMembers((prev) => {
+      const next = prev.slice(0, n);
+      while (next.length < n) next.push({ professionalId: '', professionalName: '', esNuevo: false });
+      return next;
+    });
+  }
+
+  function actualizarPosicion(i, cambios) {
+    setMembers((prev) => prev.map((m, idx) => (idx === i ? { ...m, ...cambios } : m)));
+  }
+
+  async function guardar() {
+    setError('');
+    if (!unidad.trim() || !puesto.trim() || !anchorDate) {
+      setError('Unidad, puesto y fecha ancla son obligatorios.');
+      return;
+    }
+    if (members.some((m) => !m.professionalId && !m.professionalName.trim())) {
+      setError('Todas las posiciones del ciclo necesitan un profesional.');
+      return;
+    }
+    setGuardando(true);
+    try {
+      const resueltos = [];
+      for (let i = 0; i < members.length; i++) {
+        const m = members[i];
+        if (m.professionalId) {
+          const existente = profesionales.find((p) => p.id === m.professionalId);
+          resueltos.push({ position: i, professionalId: m.professionalId, professionalName: existente?.nombre || '' });
+        } else {
+          const creado = await createProfessional(agendaId, {
+            id: nuevoProfesionalId(),
+            nombre: m.professionalName.trim(),
+            tipo: 'Médico(a) Cirujano(a)',
+            tieneTurno: true,
+            esSoloTurno: true,
+          });
+          resueltos.push({ position: i, professionalId: creado.id, professionalName: creado.nombre });
+        }
+      }
+      const preset = DURACION_TURNO_PRESETS.find((p) => p.id === duracionTurno) || DURACION_TURNO_PRESETS[0];
+      const payload = {
+        unidad: unidad.trim(),
+        puesto: puesto.trim(),
+        cycleDays,
+        anchorDate,
+        startMinutes: preset.startMinutes,
+        durationMinutes: preset.durationMinutes,
+        affectsJornada: afectaJornada,
+        members: resueltos,
+      };
+      if (rotacion) {
+        await updateShiftRotation(servicioId, rotacion.id, payload);
+      } else {
+        await createShiftRotation(servicioId, payload);
+      }
+      onGuardado();
+    } catch (e) {
+      setError(e?.message || 'No se pudo guardar la rotación. Si agregaste un profesional nuevo, revisa que la agenda esté en borrador.');
+    } finally {
+      setGuardando(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 flex items-center justify-center z-[80] p-4" style={{ background: 'rgba(30,46,51,0.5)' }} onClick={onCancelar}>
+      <div className="bg-white rounded-xl w-full max-w-md p-4 shadow-2xl max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="text-sm font-semibold text-slate-800 mb-3">{rotacion ? 'Editar rotación' : 'Nueva rotación'}</div>
+        <div className="grid grid-cols-2 gap-2.5 mb-2.5">
+          <label className="text-xs text-slate-600 font-medium block">
+            Unidad
+            <input value={unidad} onChange={(e) => setUnidad(e.target.value)} placeholder="Ej: Unidad Coronaria" className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm" />
+          </label>
+          <label className="text-xs text-slate-600 font-medium block">
+            Puesto
+            <input value={puesto} onChange={(e) => setPuesto(e.target.value)} placeholder="Ej: Puesto A" className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm" />
+          </label>
+          <label className="text-xs text-slate-600 font-medium block">
+            Ciclo (días)
+            <input type="number" min={1} max={31} value={cycleDays} onChange={(e) => cambiarCycleDays(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm" />
+          </label>
+          <label className="text-xs text-slate-600 font-medium block">
+            Fecha ancla (posición 0)
+            <input type="date" value={anchorDate} onChange={(e) => setAnchorDate(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm" />
+          </label>
+          <label className="text-xs text-slate-600 font-medium block col-span-2">
+            Duración del turno
+            <select value={duracionTurno} onChange={(e) => setDuracionTurno(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm bg-white">
+              {DURACION_TURNO_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-600 font-medium col-span-2">
+            <input type="checkbox" checked={afectaJornada} onChange={(e) => setAfectaJornada(e.target.checked)} className="rounded" />
+            Este turno resta horas de jornada (Art. 19) al cruzarse — desmárcalo para roles como un "llamado" de respaldo que no debe descontar horas efectivas
+          </label>
+        </div>
+        <div className="text-xs text-slate-600 font-medium mb-1.5">Orden del ciclo</div>
+        <div className="space-y-1.5">
+          {members.map((m, i) => (
+            <div key={i} className="flex items-center gap-1.5">
+              <span className="text-[10px] text-slate-400 w-4 text-right">{i}</span>
+              {!m.esNuevo ? (
+                <select
+                  value={m.professionalId}
+                  onChange={(e) => {
+                    if (e.target.value === '__nuevo__') {
+                      actualizarPosicion(i, { professionalId: '', professionalName: '', esNuevo: true });
+                    } else {
+                      actualizarPosicion(i, { professionalId: e.target.value });
+                    }
+                  }}
+                  className="flex-1 text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white"
+                >
+                  <option value="">— Selecciona —</option>
+                  {profesionales.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                  <option value="__nuevo__">+ Nuevo profesional (solo turno)</option>
+                </select>
+              ) : (
+                <>
+                  <input
+                    autoFocus
+                    value={m.professionalName}
+                    onChange={(e) => actualizarPosicion(i, { professionalName: e.target.value })}
+                    placeholder="Nombre completo"
+                    className="flex-1 text-xs rounded-lg border border-slate-300 px-2 py-1.5"
+                  />
+                  <button onClick={() => actualizarPosicion(i, { esNuevo: false, professionalName: '' })} className="text-[10px] text-slate-400 hover:text-slate-600 px-1">
+                    cancelar
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+        {error && <div className="text-xs text-[#B6522F] mt-2">{error}</div>}
+        <button
+          onClick={guardar}
+          disabled={guardando}
+          style={{ background: '#4C7C74' }}
+          className="w-full text-white text-sm font-medium py-2 rounded-lg mt-3 disabled:opacity-50"
+        >
+          {guardando ? 'Guardando…' : 'Guardar'}
+        </button>
+        <button onClick={onCancelar} className="w-full text-slate-500 text-sm py-2 rounded-lg mt-1.5">
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Sustituciones puntuales de una rotación: reemplazan, solo para una fecha exacta, a quien
+// tocaría por cálculo del ciclo.
+function SustitucionesPanel({ rotacion, servicioId, profesionales, onCambio }) {
+  const [fecha, setFecha] = useState('');
+  const [profesionalId, setProfesionalId] = useState('');
+  const [nota, setNota] = useState('');
+  const [guardando, setGuardando] = useState(false);
+
+  async function agregar() {
+    if (!fecha || !profesionalId) return;
+    const prof = profesionales.find((p) => p.id === profesionalId);
+    setGuardando(true);
+    try {
+      await createShiftOverride(servicioId, rotacion.id, {
+        date: fecha,
+        professionalId,
+        professionalName: prof?.nombre || '',
+        note: nota.trim() || null,
+      });
+      setFecha('');
+      setProfesionalId('');
+      setNota('');
+      await onCambio();
+    } finally {
+      setGuardando(false);
+    }
+  }
+
+  return (
+    <div className="mt-2.5 pt-2.5 border-t border-slate-100">
+      <div className="space-y-1">
+        {rotacion.overrides.map((o) => (
+          <div key={o.id} className="flex items-center justify-between text-xs bg-slate-50 rounded-lg px-2.5 py-1.5">
+            <span className="text-slate-600">{formatoFechaCorta(o.date)} — {o.professionalName}{o.note ? ` (${o.note})` : ''}</span>
+            <button
+              onClick={async () => { await deleteShiftOverride(servicioId, rotacion.id, o.id); await onCambio(); }}
+              className="text-[#B6522F] hover:underline"
+            >
+              Quitar
+            </button>
+          </div>
+        ))}
+        {rotacion.overrides.length === 0 && <div className="text-[11px] text-slate-400 italic">Sin sustituciones.</div>}
+      </div>
+      <div className="flex items-center gap-1.5 mt-2">
+        <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2 py-1.5" />
+        <select value={profesionalId} onChange={(e) => setProfesionalId(e.target.value)} className="flex-1 text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white">
+          <option value="">— Profesional —</option>
+          {profesionales.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+        </select>
+        <input value={nota} onChange={(e) => setNota(e.target.value)} placeholder="Nota (opcional)" className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 w-28" />
+        <button onClick={agregar} disabled={guardando || !fecha || !profesionalId} className="text-xs text-white px-2.5 py-1.5 rounded-lg disabled:opacity-40" style={{ background: '#4C7C74' }}>
+          Agregar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Editar un día puntual directamente desde el calendario: crea o reemplaza una sustitución
+// (ShiftRotationOverride) para esa fecha, o la quita para volver a lo que calcula el ciclo. Es
+// la misma API que SustitucionesPanel, solo que entrando por el día en vez de por el formulario
+// aparte — así el jefe va cubriendo puesto por puesto según quién esté disponible ese día.
+function EditarTurnoDiaDialog({ edicion, servicioId, profesionales, onCancelar, onGuardado }) {
+  const { fecha, fechaISO: fechaStr, unidad, puesto, rotacion, entry } = edicion;
+  const overrideActual = rotacion.overrides.find((o) => o.date === fechaStr);
+  const [profesionalId, setProfesionalId] = useState(entry?.professionalId || '');
+  const [nota, setNota] = useState(overrideActual?.note || '');
+  const [guardando, setGuardando] = useState(false);
+  const [error, setError] = useState('');
+
+  async function guardar(vacante) {
+    setError('');
+    setGuardando(true);
+    try {
+      const prof = vacante ? null : profesionales.find((p) => p.id === profesionalId);
+      if (!vacante && !prof) {
+        setError('Selecciona un profesional o marca el puesto como vacante.');
+        setGuardando(false);
+        return;
+      }
+      await createShiftOverride(servicioId, rotacion.id, {
+        date: fechaStr,
+        professionalId: prof?.id || null,
+        professionalName: vacante ? 'Vacante' : prof.nombre,
+        note: nota.trim() || null,
+      });
+      await onGuardado();
+    } catch (e) {
+      setError(e?.message || 'No se pudo guardar.');
+    } finally {
+      setGuardando(false);
+    }
+  }
+
+  async function quitarSustitucion() {
+    if (!overrideActual) return;
+    setGuardando(true);
+    try {
+      await deleteShiftOverride(servicioId, rotacion.id, overrideActual.id);
+      await onGuardado();
+    } finally {
+      setGuardando(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 flex items-center justify-center z-[80] p-4" style={{ background: 'rgba(30,46,51,0.5)' }} onClick={onCancelar}>
+      <div className="bg-white rounded-xl w-full max-w-sm p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="text-sm font-semibold text-slate-800">{unidad} — {puesto}</div>
+        <div className="text-xs text-slate-500 mb-3 capitalize">{fecha.toLocaleDateString('es-CL', { weekday: 'long', day: 'numeric', month: 'long' })}</div>
+        <div className="text-[11px] text-slate-500 bg-slate-50 rounded-lg px-2.5 py-1.5 mb-3">
+          {entry?.professionalName ? (
+            <>Corresponde ahora: <strong>{entry.professionalName}</strong>{entry.esSustitucion ? ' (sustitución ya cargada)' : ' (por cálculo del ciclo)'}</>
+          ) : 'Puesto sin asignar todavía.'}
+        </div>
+        <label className="text-xs text-slate-600 font-medium block mb-2.5">
+          Profesional que cubre este día
+          <select value={profesionalId} onChange={(e) => setProfesionalId(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm bg-white">
+            <option value="">— Selecciona —</option>
+            {profesionales.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+          </select>
+        </label>
+        <label className="text-xs text-slate-600 font-medium block mb-3">
+          Nota (opcional)
+          <input value={nota} onChange={(e) => setNota(e.target.value)} placeholder="Ej: cambio por disponibilidad" className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm" />
+        </label>
+        {error && <div className="text-xs text-[#B6522F] mb-2.5">{error}</div>}
+        <div className="flex items-center gap-2 flex-wrap">
+          <button onClick={() => guardar(false)} disabled={guardando || !profesionalId} className="text-xs text-white px-3 py-1.5 rounded-lg disabled:opacity-40" style={{ background: '#4C7C74' }}>
+            Guardar
+          </button>
+          <button onClick={() => guardar(true)} disabled={guardando} className="text-xs text-slate-600 px-3 py-1.5 rounded-lg border border-slate-300 disabled:opacity-40">
+            Marcar vacante
+          </button>
+          {overrideActual && (
+            <button onClick={quitarSustitucion} disabled={guardando} className="text-xs text-[#B6522F] px-3 py-1.5 rounded-lg border border-[#F2D9CC] disabled:opacity-40">
+              Quitar sustitución
+            </button>
+          )}
+          <button onClick={onCancelar} className="text-xs text-slate-400 px-3 py-1.5 rounded-lg ml-auto">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEditar }) {
+  const [mesInicio, setMesInicio] = useState(() => {
+    const primeraFecha = roster?.dias?.[0]?.date;
+    if (primeraFecha) {
+      const [y, m] = primeraFecha.split('-').map(Number);
+      return new Date(y, m - 1, 1);
+    }
+    return primerDiaMes(new Date());
+  });
+  const [datosMes, setDatosMes] = useState(roster || null);
+  const [cargando, setCargando] = useState(false);
+  const [detalleAbierto, setDetalleAbierto] = useState(null);
+  const [dialogoRotacion, setDialogoRotacion] = useState(null); // { rotacion: null|obj }
+  const [rotacionExpandida, setRotacionExpandida] = useState(null);
+  const [edicionDia, setEdicionDia] = useState(null); // { fechaISO, unidad, puesto, rotacion, entry } | null
+
+  const cargarMes = React.useCallback(() => {
+    if (!servicioId) return;
+    setCargando(true);
+    const desde = fechaISO(mesInicio);
+    const hasta = fechaISO(new Date(mesInicio.getFullYear(), mesInicio.getMonth() + 1, 0));
+    return fetchShiftRoster(servicioId, desde, hasta)
+      .then((data) => setDatosMes(data))
+      .catch(() => {})
+      .finally(() => setCargando(false));
+  }, [servicioId, mesInicio]);
+
+  useEffect(() => {
+    setDetalleAbierto(null);
+    cargarMes();
+  }, [cargarMes]);
+
+  const datos = datosMes || roster;
+  if (!datos) {
+    return <div className="text-sm text-slate-400 italic text-center py-10">Cargando turno rotativo…</div>;
+  }
+
+  const puestos = datos.puestos || [];
+  const diaPorFecha = new Map((datos.dias || []).map((d) => [d.date, d]));
+  const primerDia = primerDiaMes(mesInicio);
+  const diasEnMes = new Date(mesInicio.getFullYear(), mesInicio.getMonth() + 1, 0).getDate();
+  const celdasVacias = diaSemanaLunesPrimero(primerDia);
+  const celdas = [];
+  for (let i = 0; i < celdasVacias; i++) celdas.push(null);
+  for (let d = 1; d <= diasEnMes; d++) celdas.push(new Date(mesInicio.getFullYear(), mesInicio.getMonth(), d));
+  while (celdas.length % 7 !== 0) celdas.push(null);
+  const semanas = [];
+  for (let i = 0; i < celdas.length; i += 7) semanas.push(celdas.slice(i, i + 7));
+
+  const conteos = [...(datos.turnosUltimos30Dias || [])].sort((a, b) => b.count - a.count);
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center gap-3">
+        <button
+          onClick={() => setMesInicio((m) => new Date(m.getFullYear(), m.getMonth() - 1, 1))}
+          className="text-xs text-slate-500 hover:text-slate-800 px-2 py-1 rounded-lg border border-slate-200"
+        >
+          ‹ Anterior
+        </button>
+        <div className="text-sm font-semibold text-slate-800 capitalize min-w-[160px] text-center">
+          {mesInicio.toLocaleDateString('es-CL', { month: 'long', year: 'numeric' })}
+        </div>
+        <button
+          onClick={() => setMesInicio((m) => new Date(m.getFullYear(), m.getMonth() + 1, 1))}
+          className="text-xs text-slate-500 hover:text-slate-800 px-2 py-1 rounded-lg border border-slate-200"
+        >
+          Siguiente ›
+        </button>
+        {cargando && <span className="text-[11px] text-slate-400">Cargando…</span>}
+        <div className="flex items-center gap-3 ml-auto">
+          {puestos.map((puesto, i) => (
+            <div key={puesto} className="flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full" style={{ background: PUESTO_COLORES[i % PUESTO_COLORES.length] }} />
+              <span className="text-[11px] text-slate-500">{puesto}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <div className="grid grid-cols-7 bg-slate-50 text-slate-500 text-[11px] font-medium">
+            {['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'].map((d) => (
+              <div key={d} className="px-2 py-1.5 text-center border-b border-slate-100">{d}</div>
+            ))}
+          </div>
+          {semanas.map((semana, wi) => (
+            <div key={wi} className="grid grid-cols-7">
+              {semana.map((fecha, di) => {
+                if (!fecha) {
+                  return <div key={di} className="border-t border-r border-slate-100 min-h-[64px] bg-slate-50/40" />;
+                }
+                const dia = diaPorFecha.get(fechaISO(fecha));
+                return (
+                  <div key={di} className="border-t border-r border-slate-100 min-h-[64px] p-1.5">
+                    <div className="text-[11px] text-slate-400">{fecha.getDate()}</div>
+                    <div className="space-y-0.5 mt-0.5">
+                      {puestos.map((puesto, i) => {
+                        const entry = dia?.entries.find((e) => e.puesto === puesto);
+                        const rotacion = (datos.rotaciones || []).find((r) => r.puesto === puesto && r.unidad === entry?.unidad);
+                        const horario = entry
+                          ? `${hhmmDesdeMin(entry.startMinutes % 1440)}–${hhmmDesdeMin((entry.startMinutes + entry.durationMinutes) % 1440)}${entry.startMinutes + entry.durationMinutes > 1440 ? ' (+1)' : ''}`
+                          : '';
+                        const abrirEdicion = () => {
+                          if (!puedeEditar || !rotacion) return;
+                          setEdicionDia({ fechaISO: fechaISO(fecha), fecha, unidad: rotacion.unidad, puesto, rotacion, entry: entry || null });
+                        };
+                        if (!entry?.professionalName) {
+                          return rotacion ? (
+                            <button
+                              key={puesto}
+                              onClick={abrirEdicion}
+                              disabled={!puedeEditar}
+                              className="w-full text-[10px] px-1 py-0.5 rounded truncate text-left text-slate-300 border border-dashed border-slate-200 hover:border-slate-300 hover:text-slate-400"
+                            >
+                              {puesto} —
+                            </button>
+                          ) : null;
+                        }
+                        const [primerNombre] = entry.professionalName.split(' ');
+                        return (
+                          <button
+                            key={puesto}
+                            onClick={abrirEdicion}
+                            disabled={!puedeEditar}
+                            title={`${puesto}: ${entry.professionalName} · ${horario}${entry.esSustitucion ? ' (sustitución)' : ''}${puedeEditar ? ' — clic para editar' : ''}`}
+                            className="w-full text-[10px] px-1 py-0.5 rounded truncate text-left hover:opacity-70"
+                            style={{ background: `${PUESTO_COLORES[i % PUESTO_COLORES.length]}1A`, color: PUESTO_COLORES[i % PUESTO_COLORES.length] }}
+                          >
+                            {primerNombre}{entry.esSustitucion && ' *'}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+        {puestos.length > 0 && <div className="text-[11px] text-slate-400 mt-1.5">* = sustitución puntual sobre lo que calcula el ciclo.</div>}
+      </div>
+
+      {puedeEditar && (
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Rotaciones configuradas</div>
+            <button
+              onClick={() => setDialogoRotacion({ rotacion: null })}
+              className="text-xs text-[#4C7C74] font-medium hover:underline flex items-center gap-1"
+            >
+              <Plus size={13} /> Nueva rotación
+            </button>
+          </div>
+          <div className="space-y-2">
+            {(datos.rotaciones || []).map((r) => (
+              <div key={r.id} className="bg-white rounded-xl border border-slate-200 p-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-medium text-slate-800">{r.unidad} — {r.puesto}</div>
+                    <div className="text-[11px] text-slate-400">Ciclo de {r.cycleDays} días · ancla {formatoFechaCorta(r.anchorDate)} · {r.members.length} posiciones</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => setRotacionExpandida(rotacionExpandida === r.id ? null : r.id)} className="text-xs text-slate-500 hover:underline">
+                      Sustituciones ({r.overrides.length})
+                    </button>
+                    <button onClick={() => setDialogoRotacion({ rotacion: r })} className="text-xs text-[#4C7C74] hover:underline">Editar</button>
+                    <button
+                      onClick={async () => {
+                        if (!confirm(`¿Eliminar la rotación ${r.unidad} — ${r.puesto}? Deja de calcularse, pero no se borra el historial.`)) return;
+                        await deleteShiftRotation(servicioId, r.id);
+                        await cargarMes();
+                      }}
+                      className="text-xs text-[#B6522F] hover:underline"
+                    >
+                      Eliminar
+                    </button>
+                  </div>
+                </div>
+                {rotacionExpandida === r.id && (
+                  <SustitucionesPanel
+                    rotacion={r}
+                    servicioId={servicioId}
+                    profesionales={profesionales}
+                    onCambio={cargarMes}
+                  />
+                )}
+              </div>
+            ))}
+            {(datos.rotaciones || []).length === 0 && (
+              <div className="text-xs text-slate-400 italic bg-white rounded-xl border border-slate-200 p-4 text-center">Sin rotaciones configuradas todavía.</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {dialogoRotacion && (
+        <RotacionDialog
+          rotacion={dialogoRotacion.rotacion}
+          servicioId={servicioId}
+          agendaId={agendaId}
+          profesionales={profesionales}
+          onCancelar={() => setDialogoRotacion(null)}
+          onGuardado={async () => {
+            setDialogoRotacion(null);
+            await cargarMes();
+          }}
+        />
+      )}
+
+      {edicionDia && (
+        <EditarTurnoDiaDialog
+          edicion={edicionDia}
+          servicioId={servicioId}
+          profesionales={profesionales}
+          onCancelar={() => setEdicionDia(null)}
+          onGuardado={async () => {
+            setEdicionDia(null);
+            await cargarMes();
+          }}
+        />
+      )}
+
+      <div>
+        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+          Agenda efectiva y horas pendientes por recuperar — {mesInicio.toLocaleDateString('es-CL', { month: 'long', year: 'numeric' })}
+        </div>
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-50 text-slate-500">
+              <tr>
+                <th className="text-left px-3 py-2 font-medium">Profesional</th>
+                <th className="text-right px-3 py-2 font-medium">Jornada nominal</th>
+                <th className="text-right px-3 py-2 font-medium">Perdidas por turno</th>
+                <th className="text-right px-3 py-2 font-medium">Agenda efectiva</th>
+                <th className="text-right px-3 py-2 font-medium">Pendiente por recuperar</th>
+                <th className="w-8"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {(datos.proyeccion || []).map((p) => {
+                const expandido = detalleAbierto === p.professionalId;
+                const tieneDetalle = (p.detalle || []).length > 0;
+                return (
+                  <React.Fragment key={p.professionalId}>
+                    <tr
+                      className={`border-t border-slate-100 ${tieneDetalle ? 'cursor-pointer hover:bg-slate-50/60' : ''}`}
+                      onClick={() => tieneDetalle && setDetalleAbierto(expandido ? null : p.professionalId)}
+                    >
+                      <td className="px-3 py-1.5 text-slate-700">{p.professionalName}</td>
+                      <td className="px-3 py-1.5 text-right text-slate-600">{p.horasJornadaNominal.toFixed(1)} hrs</td>
+                      <td className="px-3 py-1.5 text-right text-slate-600">{p.horasPerdidasPorTurno.toFixed(1)} hrs</td>
+                      <td className="px-3 py-1.5 text-right text-slate-600">{p.horasEfectivas.toFixed(1)} hrs</td>
+                      <td className="px-3 py-1.5 text-right font-semibold" style={{ color: p.horasPerdidasPorTurno > 0 ? '#B6522F' : '#94a3b8' }}>
+                        {p.horasPerdidasPorTurno > 0 ? `${p.horasPerdidasPorTurno.toFixed(1)} hrs` : '—'}
+                      </td>
+                      <td className="px-2 text-center text-slate-400">{tieneDetalle && (expandido ? '▲' : '▼')}</td>
+                    </tr>
+                    {expandido && tieneDetalle && (
+                      <tr className="border-t border-slate-100 bg-slate-50/50">
+                        <td colSpan={6} className="px-3 py-2">
+                          <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Detalle de días perdidos</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {p.detalle.map((d) => (
+                              <span key={d.date} className="inline-flex items-center gap-1 text-[10px] bg-white border border-slate-200 rounded-full px-2 py-0.5 text-slate-600">
+                                {formatoFechaCorta(d.date)} ({d.weekday}) — {d.horas.toFixed(1)} hrs
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+              {(datos.proyeccion || []).length === 0 && (
+                <tr><td colSpan={6} className="px-3 py-6 text-center text-slate-400 italic">Sin jornada cargada que cruce con turno en este mes.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="text-[11px] text-slate-400 mt-1.5">
+          Calculado cruzando la jornada semanal cargada (plantilla por día) con las fechas reales en que el ciclo de turno le toca a cada profesional — asume que un día de turno de 24h desplaza por completo la jornada de ese mismo día. "Pendiente por recuperar" es la señal para programar esas horas de vuelta en otra semana del ciclo, no algo que la app reprograma sola.
+        </div>
+      </div>
+
+      <div>
+        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Turnos por profesional (últimos 30 días)</div>
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-50 text-slate-500">
+              <tr>
+                <th className="text-left px-3 py-2 font-medium">Profesional</th>
+                <th className="text-right px-3 py-2 font-medium">Turnos</th>
+              </tr>
+            </thead>
+            <tbody>
+              {conteos.map((c) => (
+                <tr key={c.professionalName} className="border-t border-slate-100">
+                  <td className="px-3 py-1.5 text-slate-700">{c.professionalName}</td>
+                  <td className="px-3 py-1.5 text-right text-slate-600 font-medium">{c.count}</td>
+                </tr>
+              ))}
+              {conteos.length === 0 && (
+                <tr><td colSpan={2} className="px-3 py-6 text-center text-slate-400 italic">Sin turnos en los últimos 30 días.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="text-[11px] text-slate-400 mt-1.5">Esto es carga de turno (Art. 15), no horas de jornada (Art. 19) — se muestran por separado a propósito. Úsalos juntos para decidir cuánta jornada extra programar en las semanas sin turno.</div>
+      </div>
+    </div>
+  );
+}
+
+function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especialidad, servicioId, agendaId, profesionales, bloques, cnePct, atenciones, onEditarCne, onEditarAtenciones, onDescartar, onGuardarBorrador, onCerrar, onEnviar, onAgregarProfesional, onEliminarProfesional, onRenombrarProfesional, onLimpiarProfesional, onAgregarBloque, onEditarBloque, onEliminarBloque }) {
   const [activoId, setActivoId] = useState(profesionales[0]?.id || null);
   const [dialogo, setDialogo] = useState(null);
+  const [soloBecados, setSoloBecados] = useState(false);
+  const [roster, setRoster] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!servicioId) return;
+    fetchShiftRoster(servicioId)
+      .then((data) => { if (!cancelled) setRoster(data); })
+      .catch(() => { if (!cancelled) setRoster(null); });
+    return () => { cancelled = true; };
+  }, [servicioId]);
+
+  const hayRoster = roster?.dias?.some((d) => d.entries.some((e) => e.professionalName));
   const profesional = profesionales.find((p) => p.id === activoId) || null;
   const soloLectura = !(role === 'jefe_servicio' && estado === 'borrador');
+  const hayBecados = profesionales.some((p) => p.nivelFormacion);
+  const profesionalesListados = soloBecados ? profesionales.filter((p) => p.nivelFormacion) : profesionales;
 
   return (
     <div className="fixed inset-0 bg-white z-[60] flex flex-col">
@@ -2820,19 +4176,49 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
 
       <div className="flex-1 flex overflow-hidden bg-white">
         <div className="w-48 shrink-0 border-r border-slate-200 bg-white overflow-y-auto py-2">
-          <div className="px-3 pb-1.5 text-[10px] font-semibold text-slate-400 uppercase tracking-wide">Profesionales</div>
-          {profesionales.map((p) => (
+          <button
+            onClick={() => setActivoId('__resumen__')}
+            className={`w-full flex items-center gap-1.5 text-left px-3 py-2 border-l-2 transition-colors ${activoId === '__resumen__' ? 'bg-[#EBF5F2] border-[#4C7C74] text-slate-800 font-semibold' : 'border-transparent text-slate-500 hover:bg-slate-50'}`}
+          >
+            <BarChart3 size={13} /> <span className="text-xs">Resumen general</span>
+          </button>
+          {hayRoster && (
+            <button
+              onClick={() => setActivoId('__turno__')}
+              className={`w-full flex items-center gap-1.5 text-left px-3 py-2 border-l-2 transition-colors ${activoId === '__turno__' ? 'bg-[#EBF5F2] border-[#4C7C74] text-slate-800 font-semibold' : 'border-transparent text-slate-500 hover:bg-slate-50'}`}
+            >
+              <History size={13} /> <span className="text-xs">Turno rotativo</span>
+            </button>
+          )}
+          <div className="px-3 pt-2 pb-1.5 text-[10px] font-semibold text-slate-400 uppercase tracking-wide border-t border-slate-100 mt-1">Profesionales</div>
+          {hayBecados && (
+            <label className="flex items-center gap-1.5 px-3 pb-1.5 text-[10px] text-slate-500 cursor-pointer">
+              <input type="checkbox" checked={soloBecados} onChange={(e) => setSoloBecados(e.target.checked)} />
+              Solo becados
+            </label>
+          )}
+          {profesionalesListados.map((p) => (
             <div key={p.id} className={`group flex items-center border-l-2 transition-colors ${p.id === activoId ? 'bg-[#EBF5F2] border-[#4C7C74]' : 'border-transparent hover:bg-slate-50'}`}>
               <button
                 onClick={() => setActivoId(p.id)}
                 className={`flex-1 text-left px-3 py-2 truncate ${p.id === activoId ? 'text-slate-800' : 'text-slate-500'}`}
               >
-                <div className={`text-xs truncate ${p.id === activoId ? 'font-semibold' : ''}`}>{p.nombre}</div>
+                <div className={`text-xs truncate ${p.id === activoId ? 'font-semibold' : ''}`}>
+                  {p.nombre}
+                  {p.nivelFormacion && (
+                    <span className="ml-1.5 inline-block text-[9px] font-semibold text-[#7A5CC7] bg-[#F1EDFB] px-1.5 py-0.5 rounded-full align-middle">{p.nivelFormacion}</span>
+                  )}
+                  {p.esSoloTurno ? (
+                    <span className="ml-1.5 inline-block text-[9px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full align-middle">Solo turno</span>
+                  ) : p.tieneTurno && (
+                    <span className="ml-1.5 inline-block text-[9px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full align-middle">Turno</span>
+                  )}
+                </div>
                 <div className="text-[10px] text-slate-400">{p.tipo || 'Sin tipo'}</div>
               </button>
               {!soloLectura && (
                 <button
-                  onClick={() => setDialogo({ tipo: 'editar', profesionalId: p.id, nombreInicial: p.nombre, tipoInicial: p.tipo })}
+                  onClick={() => setDialogo({ tipo: 'editar', profesionalId: p.id, nombreInicial: p.nombre, tipoInicial: p.tipo, nivelFormacionInicial: p.nivelFormacion, tieneTurnoInicial: p.tieneTurno })}
                   className="pr-2 text-slate-400 hover:text-[#4C7C74]"
                   title="Editar"
                 >
@@ -2852,7 +4238,15 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
         </div>
 
         <div className="flex-1 overflow-y-auto p-5 bg-white">
-          {!profesional ? (
+          {activoId === '__resumen__' ? (
+            <ResumenAgendaTab
+              profesionales={profesionales}
+              bloques={bloques}
+              proyeccionTurno={roster?.proyeccion}
+            />
+          ) : activoId === '__turno__' ? (
+            <TurnoRosterTab roster={roster} servicioId={servicioId} agendaId={agendaId} profesionales={profesionales} puedeEditar={role === 'jefe_servicio' || role === 'admin'} />
+          ) : !profesional ? (
             <div className="text-sm text-slate-400 italic text-center py-10">Sin profesionales cargados en esta agenda.</div>
           ) : (
             <div className="flex gap-5 items-start">
@@ -2880,8 +4274,8 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
         <ProfesionalDialog
           titulo="Nuevo profesional"
           onCancelar={() => setDialogo(null)}
-          onConfirmar={async (nombre, tipoProf) => {
-            const nuevoId = await onAgregarProfesional(nombre, tipoProf);
+          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno) => {
+            const nuevoId = await onAgregarProfesional(nombre, tipoProf, nivelFormacion, tieneTurno);
             setActivoId(nuevoId);
             setDialogo(null);
           }}
@@ -2892,9 +4286,11 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
           titulo="Editar profesional"
           nombreInicial={dialogo.nombreInicial}
           tipoInicial={dialogo.tipoInicial}
+          nivelFormacionInicial={dialogo.nivelFormacionInicial}
+          tieneTurnoInicial={dialogo.tieneTurnoInicial}
           onCancelar={() => setDialogo(null)}
-          onConfirmar={async (nombre, tipoProf) => {
-            await onRenombrarProfesional(dialogo.profesionalId, nombre, tipoProf);
+          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno) => {
+            await onRenombrarProfesional(dialogo.profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno);
             setDialogo(null);
           }}
         />
@@ -2940,8 +4336,11 @@ function AgendaDetail({ agenda, role, onClose, onAction, onGenerarResumen, resum
   const total = totalHorasAgenda(agenda.horas);
   const rendimiento = total > 0 ? (agenda.atenciones / total).toFixed(2) : '0.00';
   const puedeEditar = agenda.estado === 'borrador' && role === 'jefe_servicio';
-  const cuposSemanalesAgenda = agenda.bloquesProf.reduce((s, b) => s + (b.rendimiento || 0) * (b.duracionMin / 60), 0);
+  const cuposSemanalesAgenda = agenda.bloquesProf.filter((b) => !b.esTurno).reduce((s, b) => s + (b.rendimiento || 0) * (b.duracionMin / 60), 0);
   const produccionAnual = Math.round(cuposSemanalesAgenda * SEMANAS_POR_ANIO * (1 - AUSENTISMO_PCT / 100));
+  const [extendiendo, setExtendiendo] = useState(false);
+  const [nuevaVigenciaHasta, setNuevaVigenciaHasta] = useState(agenda.vigenciaHasta || '');
+  const puedeExtenderVigencia = agenda.estado === 'aprobada' && (role === 'jefe_servicio' || role === 'referente_programacion' || role === 'admin');
 
   return (
     <div className="fixed inset-0 flex items-stretch justify-end z-50" style={{ background: 'rgba(30,46,51,0.45)' }} onClick={onClose}>
@@ -2960,7 +4359,45 @@ function AgendaDetail({ agenda, role, onClose, onAction, onGenerarResumen, resum
         </div>
 
         <div className="p-5 space-y-5">
-          <Badge estado={agenda.estado} />
+          <div className="flex items-center gap-2 flex-wrap">
+            <Badge estado={agenda.estado} />
+            {!esVigente(agenda) && (
+              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium border bg-slate-100 text-slate-500 border-slate-300">
+                No vigente{agenda.vigenciaHasta ? ` desde ${formatoFechaCorta(agenda.vigenciaHasta)}` : ''}
+              </span>
+            )}
+            {puedeExtenderVigencia && !extendiendo && (
+              <button onClick={() => setExtendiendo(true)} className="text-xs text-[#4C7C74] font-medium hover:underline">
+                Extender vigencia
+              </button>
+            )}
+          </div>
+
+          {extendiendo && (
+            <div className="bg-white rounded-xl border border-slate-200 p-3 space-y-2">
+              <div className="text-xs font-medium text-slate-600">Nueva fecha de término de vigencia</div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="date"
+                  value={nuevaVigenciaHasta}
+                  min={agenda.vigenciaHasta || undefined}
+                  onChange={(e) => setNuevaVigenciaHasta(e.target.value)}
+                  className="flex-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#4C7C74]/40"
+                />
+                <button
+                  onClick={() => { onAction('extender_vigencia', agenda, { vigenciaHasta: nuevaVigenciaHasta }); setExtendiendo(false); }}
+                  disabled={!nuevaVigenciaHasta || (agenda.vigenciaHasta && nuevaVigenciaHasta <= agenda.vigenciaHasta)}
+                  style={{ background: '#4C7C74' }}
+                  className="text-white text-xs font-medium px-3 py-1.5 rounded-lg disabled:opacity-40"
+                >
+                  Confirmar
+                </button>
+                <button onClick={() => setExtendiendo(false)} className="text-xs text-slate-400 hover:text-slate-600 px-1">
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          )}
 
           {agenda.motivoRechazo && (
             <div className="text-xs bg-[#FBEEE8] border border-[#B6522F]/30 text-[#B6522F] rounded-lg p-3">
@@ -3287,6 +4724,10 @@ function ResumenDashboardTab({ agendas }) {
   const [filtroServicio, setFiltroServicio] = useState('todos');
   const [filtroMes, setFiltroMes] = useState('todos');
   const [filtroEstado, setFiltroEstado] = useState('todos');
+  const [filtroBecados, setFiltroBecados] = useState('todos'); // 'todos' | 'sin' | 'solo'
+  const [filtroTipoProfesional, setFiltroTipoProfesional] = useState('todos');
+  const [filtroProfesional, setFiltroProfesional] = useState('todos');
+  const [seleccion, setSeleccion] = useState([]); // [{ proceso, actividad }] — se pueden combinar varias prestaciones
 
   const servicios = useMemo(() => Array.from(new Set(agendas.map((a) => a.servicio))).sort(), [agendas]);
   const meses = useMemo(() => Array.from(new Set(agendas.map((a) => a.mes))).sort(), [agendas]);
@@ -3302,9 +4743,13 @@ function ResumenDashboardTab({ agendas }) {
     [agendas, filtroServicio, filtroMes, filtroEstado]
   );
 
-  const totalHoras = filtradas.reduce((sum, a) => sum + totalHorasAgenda(a.horas), 0);
+  const hayBecados = useMemo(() => filtradas.some((a) => a.profesionales.some((p) => p.nivelFormacion)), [filtradas]);
+
+  // %CNE y atenciones se registran por agenda completa (no por profesional), así que estos dos
+  // indicadores siempre reflejan el total de las agendas filtradas, sin importar el filtro de becados.
+  const totalHorasAgendaCompleta = filtradas.reduce((sum, a) => sum + totalHorasAgenda(a.horas), 0);
   const totalAtenciones = filtradas.reduce((sum, a) => sum + (a.atenciones || 0), 0);
-  const rendimientoProm = totalHoras ? (totalAtenciones / totalHoras).toFixed(2) : '0.00';
+  const rendimientoProm = totalHorasAgendaCompleta ? (totalAtenciones / totalHorasAgendaCompleta).toFixed(2) : '0.00';
   const cnePctGlobal = useMemo(() => {
     const pesoTotal = filtradas.reduce((sum, a) => sum + totalHorasAgenda(a.horas), 0);
     if (!pesoTotal) return '0.0';
@@ -3312,37 +4757,88 @@ function ResumenDashboardTab({ agendas }) {
     return (ponderado / pesoTotal).toFixed(1);
   }, [filtradas]);
 
-  const porServicio = useMemo(() => {
-    const map = {};
+  // Cada bloque se etiqueta con la agenda de origen para no confundir profesionales con el mismo id
+  // entre distintas agendas al filtrar por becados.
+  const todosBloquesCompleto = useMemo(
+    () => filtradas.flatMap((a) => a.bloquesProf.map((b) => ({ ...b, __agendaId: a.id, __servicio: a.servicio }))),
+    [filtradas]
+  );
+  const becadoKeys = useMemo(() => {
+    const set = new Set();
     filtradas.forEach((a) => {
-      map[a.servicio] = (map[a.servicio] || 0) + totalHorasAgenda(a.horas);
-    });
-    return Object.entries(map).map(([servicio, horas]) => ({ servicio, horas }));
-  }, [filtradas]);
-
-  const porProceso = useMemo(() => {
-    return PROCESOS_CAT.map((p) => ({
-      proceso: p,
-      horas: filtradas.reduce((sum, a) => sum + (a.horas[p] || 0), 0),
-    }));
-  }, [filtradas]);
-
-  const porTrazadora = useMemo(() => {
-    const todosBloques = filtradas.flatMap((a) => a.bloquesProf);
-    return horasPorActividad(todosBloques).slice(0, 12);
-  }, [filtradas]);
-
-  const distribucionAgregada = useMemo(() => {
-    const acc = distribucionVacia();
-    filtradas.forEach((a) => {
-      DIAS.forEach((dia) => {
-        BLOQUES.forEach((b) => {
-          acc[dia][b] += a.distribucionHoraria[dia][b] || 0;
-        });
+      a.profesionales.forEach((p) => {
+        if (p.nivelFormacion) set.add(`${a.id}|||${p.id}`);
       });
     });
-    return acc;
+    return set;
   }, [filtradas]);
+  const tipoPorProfesional = useMemo(() => {
+    const map = new Map();
+    filtradas.forEach((a) => {
+      a.profesionales.forEach((p) => {
+        map.set(`${a.id}|||${p.id}`, p.tipo || 'Sin tipo');
+      });
+    });
+    return map;
+  }, [filtradas]);
+  const tiposProfesional = useMemo(
+    () => Array.from(new Set(tipoPorProfesional.values())).sort(),
+    [tipoPorProfesional]
+  );
+  const profesionalesOpciones = useMemo(() => {
+    const list = [];
+    filtradas.forEach((a) => {
+      a.profesionales.forEach((p) => {
+        list.push({ key: `${a.id}|||${p.id}`, nombre: p.nombre, servicio: a.servicio });
+      });
+    });
+    return list.sort((a, b) => a.nombre.localeCompare(b.nombre));
+  }, [filtradas]);
+  const todosBloques = useMemo(() => {
+    return todosBloquesCompleto.filter((b) => {
+      const key = `${b.__agendaId}|||${b.profesionalId}`;
+      if (filtroBecados !== 'todos') {
+        const esBecado = becadoKeys.has(key);
+        if (filtroBecados === 'solo' ? !esBecado : esBecado) return false;
+      }
+      if (filtroTipoProfesional !== 'todos') {
+        const tipo = tipoPorProfesional.get(key);
+        if (tipo !== filtroTipoProfesional) return false;
+      }
+      if (filtroProfesional !== 'todos' && key !== filtroProfesional) return false;
+      return true;
+    });
+  }, [todosBloquesCompleto, becadoKeys, filtroBecados, tipoPorProfesional, filtroTipoProfesional, filtroProfesional]);
+
+  const totalHoras = useMemo(() => todosBloques.filter((b) => !b.esTurno).reduce((s, b) => s + b.duracionMin / 60, 0), [todosBloques]);
+
+  const porServicio = useMemo(() => {
+    const map = {};
+    todosBloques.filter((b) => !b.esTurno).forEach((b) => {
+      map[b.__servicio] = (map[b.__servicio] || 0) + b.duracionMin / 60;
+    });
+    return Object.entries(map).map(([servicio, horas]) => ({ servicio, horas: Math.round(horas * 10) / 10 }));
+  }, [todosBloques]);
+
+  const porProceso = useMemo(() => {
+    const horasPorProceso = horasDesdeBloquesProf(todosBloques);
+    return PROCESOS_CAT.map((p) => ({ proceso: p, horas: horasPorProceso[p] || 0 }));
+  }, [todosBloques]);
+
+  const porTrazadora = useMemo(() => horasPorActividadYProceso(todosBloques).slice(0, 12), [todosBloques]);
+
+  const bloquesDistribucion = useMemo(
+    () => (seleccion.length > 0 ? todosBloques.filter((b) => seleccion.some((s) => s.proceso === b.proceso && s.actividad === b.actividad)) : todosBloques),
+    [todosBloques, seleccion]
+  );
+  const distribucionAgregada = useMemo(() => distribucionDesdeBloquesProf(bloquesDistribucion), [bloquesDistribucion]);
+  const paralelosPorBloque = useMemo(() => paralelosDesdeBloquesProf(bloquesDistribucion), [bloquesDistribucion]);
+
+  const cuposNuevas = useMemo(() => todosBloques.filter((b) => esConsultaNueva(b.actividad)).reduce((s, b) => s + cuposBloque(b), 0), [todosBloques]);
+  const cuposControles = useMemo(() => todosBloques.filter((b) => esConsultaControl(b.actividad)).reduce((s, b) => s + cuposBloque(b), 0), [todosBloques]);
+  const pctConsultaNueva = cuposNuevas + cuposControles > 0 ? Math.round((cuposNuevas / (cuposNuevas + cuposControles)) * 100) : null;
+
+  const rendimientoPrestaciones = useMemo(() => rendimientoPorPrestacion(todosBloques), [todosBloques]);
 
   return (
     <div className="p-5 h-full overflow-y-auto space-y-5">
@@ -3365,9 +4861,21 @@ function ResumenDashboardTab({ agendas }) {
             <option key={e2} value={e2}>{ESTADOS[e2].label}</option>
           ))}
         </select>
-        {(filtroServicio !== 'todos' || filtroMes !== 'todos' || filtroEstado !== 'todos') && (
+        <select value={filtroTipoProfesional} onChange={(e) => setFiltroTipoProfesional(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2.5 py-1.5 bg-white">
+          <option value="todos">Todos los tipos de profesional</option>
+          {tiposProfesional.map((t) => (
+            <option key={t} value={t}>{t}</option>
+          ))}
+        </select>
+        <select value={filtroProfesional} onChange={(e) => setFiltroProfesional(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2.5 py-1.5 bg-white">
+          <option value="todos">Todos los profesionales</option>
+          {profesionalesOpciones.map((p) => (
+            <option key={p.key} value={p.key}>{p.nombre} — {p.servicio}</option>
+          ))}
+        </select>
+        {(filtroServicio !== 'todos' || filtroMes !== 'todos' || filtroEstado !== 'todos' || filtroTipoProfesional !== 'todos' || filtroProfesional !== 'todos') && (
           <button
-            onClick={() => { setFiltroServicio('todos'); setFiltroMes('todos'); setFiltroEstado('todos'); }}
+            onClick={() => { setFiltroServicio('todos'); setFiltroMes('todos'); setFiltroEstado('todos'); setFiltroTipoProfesional('todos'); setFiltroProfesional('todos'); }}
             className="text-xs text-slate-400 hover:text-slate-600 underline px-1"
           >
             Limpiar filtros
@@ -3375,7 +4883,26 @@ function ResumenDashboardTab({ agendas }) {
         )}
       </div>
 
-      <div className="grid grid-cols-4 gap-3">
+      {hayBecados && (
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-slate-500">Profesionales:</span>
+          {[
+            { value: 'todos', label: 'Todos' },
+            { value: 'sin', label: 'Sin becados' },
+            { value: 'solo', label: 'Solo becados' },
+          ].map((opt) => (
+            <button
+              key={opt.value}
+              onClick={() => setFiltroBecados(opt.value)}
+              className={`text-xs px-2.5 py-1 rounded-full border ${filtroBecados === opt.value ? 'bg-[#4C7C74] text-white border-[#4C7C74]' : 'bg-white text-slate-500 border-slate-300 hover:border-slate-400'}`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-5 gap-3">
         <div className="bg-white rounded-xl border border-slate-200 p-4">
           <div className="text-xs text-slate-500">Agendas</div>
           <div className="text-2xl font-semibold text-slate-800 mt-1">{filtradas.length}</div>
@@ -3392,7 +4919,15 @@ function ResumenDashboardTab({ agendas }) {
           <div className="text-xs text-slate-500">Rendimiento prom.</div>
           <div className="text-2xl font-semibold text-slate-800 mt-1">{rendimientoProm} <span className="text-xs font-normal text-slate-400">at/hr</span></div>
         </div>
+        <div className="bg-white rounded-xl border border-slate-200 p-4">
+          <div className="text-xs text-slate-500">% Consulta Nueva</div>
+          <div className="text-2xl font-semibold text-slate-800 mt-1">{pctConsultaNueva === null ? '—' : `${pctConsultaNueva}%`}</div>
+          <div className="text-[10px] text-slate-400 mt-0.5">{cuposNuevas} nuevas / {cuposControles} controles</div>
+        </div>
       </div>
+      {hayBecados && (
+        <div className="text-[11px] text-slate-400 -mt-3">%CNE global y Rendimiento prom. siempre son del total de agendas filtradas (se registran por agenda, no por profesional), sin importar el filtro de becados.</div>
+      )}
 
       <div>
         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Horas por servicio</div>
@@ -3413,54 +4948,103 @@ function ResumenDashboardTab({ agendas }) {
         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Horas por proceso</div>
         <div className="bg-white rounded-xl border border-slate-200 p-3" style={{ height: 200 }}>
           <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={porProceso} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
+            <BarChart data={porProceso} margin={{ top: 20, right: 10, left: -20, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
               <XAxis dataKey="proceso" tick={{ fontSize: 9 }} interval={0} />
               <YAxis tick={{ fontSize: 10 }} />
-              <Tooltip />
-              <Bar dataKey="horas" fill="#4C7C74" radius={[4, 4, 0, 0]} />
+              <Tooltip formatter={(value) => [`${value.toFixed(1)} hrs`, 'Horas']} />
+              <Bar dataKey="horas" fill="#4C7C74" radius={[4, 4, 0, 0]}>
+                <LabelList
+                  dataKey="horas"
+                  position="top"
+                  style={{ fontSize: 9, fill: '#475569' }}
+                  formatter={(value) => (totalHoras > 0 ? `${Math.round((value / totalHoras) * 100)}%` : '')}
+                />
+              </Bar>
             </BarChart>
           </ResponsiveContainer>
         </div>
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Horas por prestación (top 12)</div>
-        <div className="bg-white rounded-xl border border-slate-200 p-3" style={{ height: 300 }}>
+        <div className="flex items-center justify-between mb-1 flex-wrap gap-1">
+          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Horas por prestación (top 12)</div>
+          <div className="text-[11px] text-slate-400">Haz clic en una o varias barras para combinarlas en la distribución horaria</div>
+        </div>
+        <div className="flex flex-wrap gap-3 mb-2">
+          {PROCESOS_CAT.map((p) => (
+            <div key={p} className="flex items-center gap-1">
+              <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: COLOR_PROCESO[p] }} />
+              <span className="text-[10px] text-slate-500">{p}</span>
+            </div>
+          ))}
+        </div>
+        <div className="bg-white rounded-xl border border-slate-200 p-3" style={{ height: Math.max(300, porTrazadora.length * 34) }}>
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={porTrazadora} layout="vertical" margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
               <XAxis type="number" tick={{ fontSize: 9 }} />
-              <YAxis type="category" dataKey="actividad" tick={{ fontSize: 9 }} width={130} />
-              <Tooltip />
-              <Bar dataKey="horas" fill="#7A5CC7" radius={[0, 4, 4, 0]} />
+              <YAxis type="category" dataKey="actividad" tick={{ fontSize: 9 }} width={130} interval={0} />
+              <Tooltip formatter={(value, _name, item) => [`${value} hrs`, item.payload.proceso]} />
+              <Bar
+                dataKey="horas"
+                radius={[0, 4, 4, 0]}
+                cursor="pointer"
+                onClick={(data) => setSeleccion((prev) => {
+                  const yaEsta = prev.some((s) => s.proceso === data.proceso && s.actividad === data.actividad);
+                  return yaEsta
+                    ? prev.filter((s) => !(s.proceso === data.proceso && s.actividad === data.actividad))
+                    : [...prev, { proceso: data.proceso, actividad: data.actividad }];
+                })}
+              >
+                {porTrazadora.map((entry) => (
+                  <Cell
+                    key={`${entry.proceso}|||${entry.actividad}`}
+                    fill={seleccion.length === 0 || seleccion.some((s) => s.proceso === entry.proceso && s.actividad === entry.actividad) ? COLOR_PROCESO[entry.proceso] : '#E2E8F0'}
+                  />
+                ))}
+              </Bar>
             </BarChart>
           </ResponsiveContainer>
         </div>
       </div>
 
       <div>
-        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Distribución horaria vs. infraestructura disponible</div>
+        <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
+          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+            Distribución horaria vs. infraestructura disponible{seleccion.length > 0 ? ` — ${seleccion.length === 1 ? `${seleccion[0].actividad} (${seleccion[0].proceso})` : `${seleccion.length} prestaciones seleccionadas`}` : ''}
+          </div>
+          {seleccion.length > 0 && (
+            <button onClick={() => setSeleccion([])} className="text-[11px] text-[#4C7C74] hover:underline">
+              Ver todas las prestaciones
+            </button>
+          )}
+        </div>
         <div className="bg-white rounded-xl border border-slate-200 p-3 overflow-x-auto">
-          <div style={{ display: 'grid', gridTemplateColumns: `56px repeat(${BLOQUES.length}, 22px)`, gap: 3, width: 'max-content' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: `40px repeat(${DIAS.length}, 34px)`, gap: 3, width: 'max-content' }}>
             <div />
-            {BLOQUES.map((b) => (
-              <div key={b} className="text-[8px] text-slate-400 text-center">{b.slice(3, 5) === '00' ? b.slice(0, 2) : ''}</div>
-            ))}
             {DIAS.map((dia) => (
-              <React.Fragment key={dia}>
-                <div className="text-[11px] text-slate-600 font-medium flex items-center">{dia.slice(0, 3)}</div>
-                {BLOQUES.map((b) => {
+              <div key={dia} className="text-[10px] text-slate-600 font-medium text-center">{dia.slice(0, 3)}</div>
+            ))}
+            {BLOQUES.map((b) => (
+              <React.Fragment key={b}>
+                <div className="text-[8px] text-slate-400 flex items-center justify-end pr-1">{b.slice(3, 5) === '00' ? b.slice(0, 2) : ''}</div>
+                {DIAS.map((dia) => {
                   const horasProgramadas = distribucionAgregada[dia][b];
                   const capacidad = INFRAESTRUCTURA_CAPACIDAD[dia][b];
                   const pct = capacidad > 0 ? (horasProgramadas / capacidad) * 100 : (horasProgramadas > 0 ? 999 : 0);
                   const color = heatColor(pct);
+                  const paralelos = paralelosPorBloque[dia][b];
                   return (
                     <div
-                      key={b}
-                      title={`${dia} ${b} — ${horasProgramadas.toFixed(1)} / ${capacidad} hrs (${capacidad > 0 ? pct.toFixed(0) + '%' : 'sin capacidad'})`}
-                      style={{ background: color.bg, height: 20, borderRadius: 3 }}
-                    />
+                      key={dia}
+                      title={`${dia} ${b} — ${horasProgramadas.toFixed(1)} / ${capacidad} hrs (${capacidad > 0 ? pct.toFixed(0) + '%' : 'sin capacidad'}) · ${paralelos} profesional${paralelos === 1 ? '' : 'es'} en paralelo`}
+                      style={{ background: color.bg, height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                    >
+                      {paralelos > 0 && (
+                        <span style={{ color: color.text, fontSize: 9, fontWeight: 600 }}>{paralelos}</span>
+                      )}
+                    </div>
                   );
                 })}
               </React.Fragment>
@@ -3472,7 +5056,39 @@ function ResumenDashboardTab({ agendas }) {
             <span className="text-[10px] text-slate-400">≥130%</span>
           </div>
         </div>
-        <div className="text-[11px] text-slate-400 mt-1.5">Color = % de uso respecto a la capacidad de infraestructura (boxes/pabellones) disponible por día y bloque de 30 min. Pasa el mouse sobre una celda para ver el detalle. La capacidad es una referencia ajustable, no un dato real de infraestructura.</div>
+        <div className="text-[11px] text-slate-400 mt-1.5">Color = % de uso respecto a la capacidad de infraestructura (boxes/pabellones) disponible por día y bloque de 30 min. El número en cada celda es la cantidad de profesionales en paralelo. Pasa el mouse sobre una celda para ver el detalle. La capacidad es una referencia ajustable, no un dato real de infraestructura.</div>
+      </div>
+
+      <div>
+        <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Rendimiento por prestación</div>
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-50 text-slate-500">
+              <tr>
+                <th className="text-left px-3 py-2 font-medium">Prestación</th>
+                <th className="text-left px-3 py-2 font-medium">Proceso</th>
+                <th className="text-right px-3 py-2 font-medium">Horas</th>
+                <th className="text-right px-3 py-2 font-medium">Cupos</th>
+                <th className="text-right px-3 py-2 font-medium">Rendimiento (at/hr)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rendimientoPrestaciones.map((r) => (
+                <tr key={`${r.proceso}|||${r.actividad}`} className="border-t border-slate-100">
+                  <td className="px-3 py-1.5 text-slate-700">{r.actividad}</td>
+                  <td className="px-3 py-1.5" style={{ color: COLOR_PROCESO[r.proceso] }}>{r.proceso}</td>
+                  <td className="px-3 py-1.5 text-right text-slate-600">{r.horas.toFixed(1)}</td>
+                  <td className="px-3 py-1.5 text-right text-slate-600">{r.cupos}</td>
+                  <td className="px-3 py-1.5 text-right text-slate-600 font-medium">{r.rendimiento.toFixed(2)}</td>
+                </tr>
+              ))}
+              {rendimientoPrestaciones.length === 0 && (
+                <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400 italic">Sin prestaciones con rendimiento para este filtro.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="text-[11px] text-slate-400 mt-1.5">Solo incluye prestaciones que llevan cupos/rendimiento. Rendimiento = cupos totales ÷ horas totales de esa prestación, sumando todas las agendas filtradas.</div>
       </div>
 
       <div>
@@ -3761,21 +5377,8 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!isHydrated || backendStatus !== 'online' || !authUser) return;
-
-    const timeoutId = window.setTimeout(async () => {
-      try {
-        setSyncLabel('Guardando cambios...');
-        await syncAgendas(agendas);
-        setSyncLabel(`Guardado ${new Date().toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' })}`);
-      } catch (_error) {
-        setSyncLabel('Error al guardar en API');
-      }
-    }, 700);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [agendas, isHydrated, backendStatus]);
+  // Cada acción (crear/editar bloque, profesional, etc.) ya se guarda individualmente contra su
+  // propio endpoint en el momento en que ocurre — no existe un reenvío periódico del estado completo.
 
   async function handleLogin(payload) {
     setAuthLoading(true);
@@ -3806,9 +5409,14 @@ export default function App() {
 
   const agendasVisibles = useMemo(() => {
     const confirmadas = agendas.filter((a) => !a.pendienteConfirmar);
-    if (role === 'jefe_servicio') return confirmadas.filter((a) => a.servicio === miServicio);
+    if (role === 'jefe_servicio') {
+      // Un jefe puede tener más de un servicio a cargo (ej. Pediatría y sus subespecialidades
+      // comparten un mismo jefe) — el backend ya manda su lista completa en serviceNames.
+      const misServicios = authUser?.serviceNames?.length ? authUser.serviceNames : [miServicio];
+      return confirmadas.filter((a) => misServicios.includes(a.servicio));
+    }
     return confirmadas; // referente, admisión y subdirección ven todas las agendas confirmadas
-  }, [agendas, role, miServicio]);
+  }, [agendas, role, miServicio, authUser]);
 
   const columnas = useMemo(() => {
     const map = {};
@@ -3897,6 +5505,8 @@ export default function App() {
         id: newId,
         nombre: payload.nombre,
         tipo: payload.tipo || TIPOS_PROFESIONAL[0],
+        nivelFormacion: payload.nivelFormacion || null,
+        tieneTurno: payload.tieneTurno || false,
       });
       await refreshAgendaState(agenda.id);
       return newId;
@@ -3915,6 +5525,8 @@ export default function App() {
       await updateProfessional(agenda.id, payload.profesionalId, {
         nombre: payload.nombre,
         tipo: payload.tipo,
+        nivelFormacion: payload.nivelFormacion,
+        tieneTurno: payload.tieneTurno,
       });
       await refreshAgendaState(agenda.id);
       return;
@@ -3937,11 +5549,20 @@ export default function App() {
         clinica: payload.clinica ?? true,
         tieneRendimiento: payload.tieneRendimiento ?? true,
         rendimiento: payload.rendimiento ?? 0,
+        box: payload.box ?? null,
+        observaciones: payload.observaciones ?? '',
+        esTurno: payload.esTurno ?? false,
       });
       await refreshAgendaState(agenda.id);
       return;
     }
     if (action === 'editar_bloque_prof') {
+      // Actualiza el estado local de inmediato (antes de esperar la red) para que columnas derivadas
+      // como Duración reflejen el cambio al instante, en vez de esperar el viaje completo al servidor.
+      updateAgenda(agenda.id, (a) => {
+        a.bloquesProf = a.bloquesProf.map((b) => (b.id === payload.bloqueId ? { ...b, ...payload.cambios } : b));
+        return a;
+      });
       await updateBlock(agenda.id, payload.bloqueId, payload.cambios);
       await refreshAgendaState(agenda.id);
       return;
@@ -3999,6 +5620,16 @@ export default function App() {
       }
       return;
     }
+    if (action === 'extender_vigencia') {
+      try {
+        const updated = await extendAgendaVigencia(agenda.id, payload.vigenciaHasta);
+        replaceAgendaState(updated);
+        await refreshNotifications();
+      } catch (_error) {
+        setSyncLabel('Error al extender la vigencia');
+      }
+      return;
+    }
   }
 
   async function ejecutarRechazo(agenda, motivo) {
@@ -4034,7 +5665,7 @@ export default function App() {
   }
 
   return (
-    <div className="w-full h-[720px] bg-[#F4F2ED] flex flex-col font-sans text-slate-800 rounded-2xl overflow-hidden border border-slate-200">
+    <div className="w-full h-screen bg-[#F4F2ED] flex flex-col font-sans text-slate-800 overflow-hidden">
       <div className="bg-[#1E2E33] px-5 py-3 flex items-center justify-between shrink-0">
         <div>
           <div className="text-white font-semibold text-sm tracking-tight">Seguimiento de Agendas Institucionales</div>
@@ -4201,7 +5832,7 @@ export default function App() {
               setAgendas((a) => [...a, nueva]);
               setShowNuevo(false);
               setShowEditorFor(nueva.id);
-              setSyncLabel('Agenda creada en local; la API la sincronizará al guardar');
+              setSyncLabel('No se pudo crear la agenda en el servidor. Inténtalo de nuevo.');
             }
           }}
         />
@@ -4214,8 +5845,14 @@ export default function App() {
           role={role}
           esNueva={agendaEnEditor.pendienteConfirmar}
           especialidad={ESPECIALIDAD_POR_SERVICIO[agendaEnEditor.servicio] || 'No Aplica'}
+          servicioId={agendaEnEditor.servicioId}
+          agendaId={agendaEnEditor.id}
           profesionales={agendaEnEditor.profesionales}
           bloques={agendaEnEditor.bloquesProf}
+          cnePct={agendaEnEditor.cnePct}
+          atenciones={agendaEnEditor.atenciones}
+          onEditarCne={(valor) => handleAction('editar_cne', agendaEnEditor, { valor })}
+          onEditarAtenciones={(valor) => handleAction('editar_atenciones', agendaEnEditor, { valor })}
           onGuardarBorrador={async () => {
             await handleAction('confirmar_creacion', agendaEnEditor, {});
             setShowEditorFor(null);
@@ -4234,12 +5871,12 @@ export default function App() {
             await handleAction('enviar', agendaEnEditor);
             setShowEditorFor(null);
           }}
-          onAgregarProfesional={async (nombre, tipoProf) => {
+          onAgregarProfesional={async (nombre, tipoProf, nivelFormacion, tieneTurno) => {
             const nuevoId = nuevoProfesionalId();
-            return handleAction('agregar_profesional', agendaEnEditor, { nombre, tipo: tipoProf, idPrefijado: nuevoId });
+            return handleAction('agregar_profesional', agendaEnEditor, { nombre, tipo: tipoProf, nivelFormacion, tieneTurno, idPrefijado: nuevoId });
           }}
           onEliminarProfesional={async (profesionalId) => handleAction('quitar_profesional', agendaEnEditor, { profesionalId })}
-          onRenombrarProfesional={async (profesionalId, nombre, tipoProf) => handleAction('renombrar_profesional', agendaEnEditor, { profesionalId, nombre, tipo: tipoProf })}
+          onRenombrarProfesional={async (profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno) => handleAction('renombrar_profesional', agendaEnEditor, { profesionalId, nombre, tipo: tipoProf, nivelFormacion, tieneTurno })}
           onLimpiarProfesional={async (profesionalId) => handleAction('limpiar_bloques_profesional', agendaEnEditor, { profesionalId })}
           onAgregarBloque={(profesionalId, anterior, siguiente) => {
             const valores = calcularInsercion(anterior, siguiente);

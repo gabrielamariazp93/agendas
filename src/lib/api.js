@@ -86,13 +86,6 @@ export async function fetchAgenda(externalId) {
   return request(`/agendas/${externalId}`);
 }
 
-export async function syncAgendas(agendas) {
-  return request('/agendas/sync', {
-    method: 'POST',
-    body: JSON.stringify({ agendas }),
-  });
-}
-
 export async function fetchBootstrap() {
   return request('/bootstrap');
 }
@@ -136,6 +129,13 @@ export async function transitionAgenda(externalId, targetStatus, comment) {
   return request(`/agendas/${externalId}/actions/transition`, {
     method: 'POST',
     body: JSON.stringify({ targetStatus, comment }),
+  });
+}
+
+export async function extendAgendaVigencia(externalId, vigenciaHasta) {
+  return request(`/agendas/${externalId}/actions/extend-vigencia`, {
+    method: 'POST',
+    body: JSON.stringify({ vigenciaHasta }),
   });
 }
 
@@ -204,4 +204,41 @@ export async function fetchCatalogProfessions() {
 
 export async function fetchReferencePerformance(params) {
   return request(`/catalog/reference-performance${buildQuery(params)}`);
+}
+
+export async function fetchShiftRoster(serviceId, from, to) {
+  return request(`/services/${serviceId}/shift-roster${buildQuery({ from, to })}`);
+}
+
+export async function createShiftRotation(serviceId, payload) {
+  return request(`/services/${serviceId}/shift-rotations`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateShiftRotation(serviceId, rotationId, payload) {
+  return request(`/services/${serviceId}/shift-rotations/${rotationId}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteShiftRotation(serviceId, rotationId) {
+  return request(`/services/${serviceId}/shift-rotations/${rotationId}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function createShiftOverride(serviceId, rotationId, payload) {
+  return request(`/services/${serviceId}/shift-rotations/${rotationId}/overrides`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteShiftOverride(serviceId, rotationId, overrideId) {
+  return request(`/services/${serviceId}/shift-rotations/${rotationId}/overrides/${overrideId}`, {
+    method: 'DELETE',
+  });
 }

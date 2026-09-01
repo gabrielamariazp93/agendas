@@ -28,7 +28,7 @@ export function buildSessionExpiry() {
   return expiresAt;
 }
 
-export function serializeUser(user) {
+export function serializeUser(user, access = {}) {
   return {
     id: user.id,
     email: user.email,
@@ -36,5 +36,7 @@ export function serializeUser(user) {
     role: user.role,
     serviceId: user.serviceId ?? null,
     serviceName: user.service?.name ?? null,
+    serviceIds: access.serviceIds ?? (user.serviceId ? [user.serviceId] : []),
+    serviceNames: access.serviceNames ?? (user.service?.name ? [user.service.name] : []),
   };
 }

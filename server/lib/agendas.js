@@ -37,6 +37,9 @@ export function serializeAgenda(record) {
       id: professional.externalId || professional.id,
       nombre: professional.name,
       tipo: professional.type,
+      nivelFormacion: professional.trainingLevel,
+      esSoloTurno: professional.isShiftOnly,
+      tieneTurno: professional.hasTurno,
     }));
 
   const professionalIdMap = new Map(
@@ -66,11 +69,15 @@ export function serializeAgenda(record) {
       clinica: block.isClinical,
       tieneRendimiento: block.hasPerformance,
       rendimiento: block.performance,
+      box: block.box,
+      observaciones: block.observations,
+      esTurno: block.isShift,
     }));
 
   return {
     id: isNaN(Number(record.externalId)) ? record.externalId : Number(record.externalId),
     servicio: record.serviceName,
+    servicioId: record.serviceId,
     jefe: record.chiefName,
     mes: record.monthLabel,
     vigenciaDesde: record.validFrom ? record.validFrom.toISOString().slice(0, 10) : null,
@@ -165,6 +172,9 @@ export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
         name: professional.nombre,
         type: professional.tipo,
         professionCatalog: professional.tipo,
+        trainingLevel: professional.nivelFormacion ?? null,
+        hasTurno: Boolean(professional.tieneTurno ?? false),
+        isShiftOnly: Boolean(professional.esSoloTurno ?? false),
         sortOrder: index,
       },
     });
@@ -189,6 +199,9 @@ export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
         isClinical: Boolean(block.clinica ?? true),
         hasPerformance: Boolean(block.tieneRendimiento ?? true),
         performance: Number(block.rendimiento ?? 0),
+        box: block.box ?? null,
+        observations: block.observaciones ?? null,
+        isShift: Boolean(block.esTurno ?? false),
       },
     });
   }

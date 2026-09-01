@@ -13,10 +13,15 @@ model Service {
   name               String   @unique
   specialtyCatalog   String?
   chiefName          String?
+  // Agrupa varios servicios bajo un mismo jefe (ej. Pediatría y sus subespecialidades) — un
+  // jefe_servicio asignado a un servicio con groupName ve TODOS los servicios que comparten
+  // ese mismo groupName, no solo el suyo. null = servicio con jefe propio, sin agrupar.
+  groupName          String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
   users              User[]
   agendas            Agenda[]
+  shiftRotations     ShiftRotation[]
 }
 
 model User {
@@ -58,6 +63,9 @@ model Agenda {
   hoursJson       String             @default("{}")
   distributionJson String            @default("{}")
   sourceSnapshot  String?
+  vigenciaAlerta15dEnviada Boolean   @default(false)
+  vigenciaAlerta5dEnviada  Boolean   @default(false)
+  vigenciaAlerta0dEnviada  Boolean   @default(false)
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
   service         Service?           @relation(fields: [serviceId], references: [id], onDelete: SetNull)
@@ -79,11 +87,16 @@ model AgendaProfessional {
   name       String
   type       String
   professionCatalog String?
+  trainingLevel String?
+  isShiftOnly Boolean     @default(false)
+  hasTurno   Boolean      @default(false)
   sortOrder  Int          @default(0)
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt
   agenda     Agenda       @relation(fields: [agendaId], references: [id], onDelete: Cascade)
   blocks     AgendaBlock[]
+  shiftRotationMemberships ShiftRotationMember[]
+  shiftRotationOverrides   ShiftRotationOverride[]
 
   @@unique([agendaId, externalId])
   @@index([agendaId, type])
@@ -105,6 +118,9 @@ model AgendaBlock {
   performance     Float              @default(0)
   suggestedPerformance Float?
   performanceSource String?
+  box             String?
+  observations    String?
+  isShift         Boolean            @default(false)
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
   agenda          Agenda             @relation(fields: [agendaId], references: [id], onDelete: Cascade)
@@ -223,4 +239,59 @@ model NormativeDocument {
   filePath    String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+}
+
+// Rotación de turno (Art. 15) calculada a partir de un orden fijo de personas + una fecha
+// ancla, en vez de una tabla de fechas cargada mes a mes. Ver quién corresponde en una fecha
+// dada se calcula con (fecha - anchorDate) mod cycleDays, salvo que exista un override puntual.
+model ShiftRotation {
+  id              String   @id @default(cuid())
+  serviceId       String
+  unidad          String
+  puesto          String
+  cycleDays       Int
+  anchorDate      DateTime
+  startMinutes    Int      @default(480)
+  durationMinutes Int      @default(1440)
+  active          Boolean  @default(true)
+  // false para turnos que no deben restar horas de jornada al cruzarse (ej. un "llamado"
+  // telefónico de respaldo) — igual aparecen en el calendario y en turnosUltimos30Dias, pero
+  // se excluyen del cálculo de horas perdidas/efectivas.
+  affectsJornada  Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  service   Service                 @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  members   ShiftRotationMember[]
+  overrides ShiftRotationOverride[]
+
+  @@unique([serviceId, unidad, puesto])
+  @@index([serviceId])
+}
+
+model ShiftRotationMember {
+  id               String  @id @default(cuid())
+  rotationId       String
+  position         Int
+  professionalId   String?
+  professionalName String
+
+  rotation     ShiftRotation       @relation(fields: [rotationId], references: [id], onDelete: Cascade)
+  professional AgendaProfessional? @relation(fields: [professionalId], references: [id], onDelete: SetNull)
+
+  @@unique([rotationId, position])
+}
+
+model ShiftRotationOverride {
+  id               String   @id @default(cuid())
+  rotationId       String
+  date             DateTime
+  professionalId   String?
+  professionalName String
+  note             String?
+
+  rotation     ShiftRotation       @relation(fields: [rotationId], references: [id], onDelete: Cascade)
+  professional AgendaProfessional? @relation(fields: [professionalId], references: [id], onDelete: SetNull)
+
+  @@unique([rotationId, date])
 }
