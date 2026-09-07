@@ -2,7 +2,7 @@ import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LabelList, Cell } from 'recharts';
 import {
   Bell, FileText, MessageSquare, LayoutGrid, Plus, X, ChevronDown, Pencil,
-  CheckCircle2, XCircle, ArrowUpCircle, UploadCloud, Send, Sparkles, Loader2, BarChart3, History, Users
+  CheckCircle2, XCircle, ArrowUpCircle, UploadCloud, Send, Sparkles, Loader2, BarChart3, History, Users, IdCard, DoorOpen, Building2
 } from 'lucide-react';
 import {
   createAgenda,
@@ -35,6 +35,13 @@ import {
   deleteShiftOverride,
   updateBlock,
   updateProfessional,
+  uploadHrDotacion,
+  fetchHrSummary,
+  fetchHrPersonas,
+  uploadPabellonPlan,
+  fetchPabellonSummary,
+  fetchPabellonCapacidad,
+  updateAgendaFields,
 } from './src/lib/api.js';
 
 /* ---------------------------------------------------------
@@ -2033,6 +2040,47 @@ function heatColorOcupacion(horasEnBloque) {
   return { bg: `hsl(165, 45%, ${lightness}%)` };
 }
 
+// Mapa de calor día×bloque de la capacidad REAL de pabellón (cantidad de pabellones asignados
+// según la planilla de infraestructura), en el mismo formato visual que el heatmap de "horas
+// programadas" de al lado — para poder comparar los dos mapas directamente, celda a celda, en
+// vez de mezclar la capacidad dentro de un solo número de color combinado.
+function CapacidadPabellonHeatmap({ grid }) {
+  const maxCapacidad = Math.max(1, ...DIAS.flatMap((d) => BLOQUES.map((b) => grid[d]?.[b] || 0)));
+  return (
+    <div>
+      <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">Capacidad de pabellón (planilla de infraestructura)</div>
+      <div className="bg-white rounded-xl border border-slate-200 p-3 overflow-x-auto">
+        <div style={{ display: 'grid', gridTemplateColumns: `40px repeat(${DIAS.length}, 34px)`, gap: 3, width: 'max-content' }}>
+          <div />
+          {DIAS.map((dia) => (
+            <div key={dia} className="text-[10px] text-slate-600 font-medium text-center">{dia.slice(0, 3)}</div>
+          ))}
+          {BLOQUES.map((b) => (
+            <React.Fragment key={b}>
+              <div className="text-[8px] text-slate-400 flex items-center justify-end pr-1">{b.slice(3, 5) === '00' ? b.slice(0, 2) : ''}</div>
+              {DIAS.map((dia) => {
+                const pabellones = grid[dia]?.[b] || 0;
+                const pct = pabellones > 0 ? Math.max(35, (pabellones / maxCapacidad) * 100) : 0;
+                const color = heatColor(pct);
+                return (
+                  <div
+                    key={dia}
+                    title={`${dia} ${b} — ${pabellones} pabellón${pabellones === 1 ? '' : 'es'} asignado${pabellones === 1 ? '' : 's'}`}
+                    style={{ background: pabellones > 0 ? color.bg : '#F8FAFC', height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                  >
+                    {pabellones > 0 && <span style={{ color: color.text, fontSize: 9, fontWeight: 600 }}>{pabellones}</span>}
+                  </div>
+                );
+              })}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+      <div className="text-[11px] text-slate-400 mt-1.5">Número = cantidad de pabellones asignados a este servicio ese bloque, según la última planilla cargada en Infraestructura.</div>
+    </div>
+  );
+}
+
 // Agrupa las horas por actividad real (dinámico: depende de lo que cada profesional tenga cargado)
 function horasPorActividad(bloques) {
   const map = {};
@@ -2460,26 +2508,119 @@ function LoginScreen({ onLogin, loading, error }) {
   );
 }
 
-function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, nivelFormacionInicial, tieneTurnoInicial, onConfirmar, onCancelar }) {
+function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, nivelFormacionInicial, tieneTurnoInicial, rutInicial, onConfirmar, onCancelar }) {
   const [nombre, setNombre] = useState(nombreInicial || '');
   const [tipo, setTipo] = useState(tipoInicial || TIPOS_PROFESIONAL[0]);
   const [esBecado, setEsBecado] = useState(!!nivelFormacionInicial);
   const [nivelDetalle, setNivelDetalle] = useState((nivelFormacionInicial || '').replace(/^Becado\s*/i, ''));
   const [tieneTurno, setTieneTurno] = useState(!!tieneTurnoInicial);
+  const [rut, setRut] = useState(rutInicial || null);
+  const [vinculado, setVinculado] = useState(rutInicial ? { rut: rutInicial, nombreFuncionario: nombreInicial, cargo: '', unidad: '' } : null);
+  // Empieza SIEMPRE en modo búsqueda (incluso al editar un profesional ya cargado a mano sin
+  // rut) — antes quedaba en modo manual por defecto cada vez que no había rutInicial, lo que
+  // dejaba la caja de búsqueda visible pero con el useEffect de búsqueda desactivado, así que
+  // escribir ahí nunca mostraba resultados. El usuario recién pasa a manual si hace clic en
+  // "no está en la dotación".
+  const [modoManual, setModoManual] = useState(false);
+  const [busqueda, setBusqueda] = useState('');
+  const [resultados, setResultados] = useState([]);
+  const [buscando, setBuscando] = useState(false);
+
+  useEffect(() => {
+    if (modoManual || busqueda.trim().length < 2) { setResultados([]); return; }
+    let cancelado = false;
+    setBuscando(true);
+    const timeoutId = setTimeout(async () => {
+      try {
+        const data = await fetchHrPersonas(busqueda.trim());
+        if (!cancelado) setResultados(data.items || []);
+      } catch (_err) {
+        if (!cancelado) setResultados([]);
+      } finally {
+        if (!cancelado) setBuscando(false);
+      }
+    }, 300);
+    return () => { cancelado = true; clearTimeout(timeoutId); };
+  }, [busqueda, modoManual]);
+
+  function elegirPersona(p) {
+    setVinculado(p);
+    setRut(p.rut);
+    setNombre(p.nombreFuncionario);
+    setBusqueda('');
+    setResultados([]);
+  }
+
+  function quitarVinculo() {
+    setVinculado(null);
+    setRut(null);
+    setModoManual(true);
+  }
+
   return (
     <div className="fixed inset-0 flex items-center justify-center z-[80] p-4" style={{ background: 'rgba(30,46,51,0.5)' }} onClick={onCancelar}>
       <div className="bg-white rounded-xl w-full max-w-xs p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="text-sm font-semibold text-slate-800 mb-3">{titulo}</div>
-        <label className="text-xs text-slate-600 font-medium block mb-2.5">
-          Nombre
-          <input
-            autoFocus
-            value={nombre}
-            onChange={(e) => setNombre(e.target.value)}
-            placeholder="Ej: Dr./Dra. ..."
-            className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm focus:outline-none"
-          />
-        </label>
+
+        {vinculado ? (
+          <div className="mb-2.5 rounded-lg border border-[#4C7C74]/30 bg-[#EBF5F2] px-2.5 py-2">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-slate-800 truncate">{vinculado.nombreFuncionario}</div>
+                <div className="text-[10px] text-slate-500 mt-0.5">
+                  RUT {vinculado.rut}{vinculado.cargo ? ` · ${vinculado.cargo}` : ''}
+                </div>
+                {vinculado.unidad && <div className="text-[10px] text-slate-400">{vinculado.unidad}</div>}
+              </div>
+              <button onClick={quitarVinculo} className="text-[10px] text-[#4C7C74] hover:underline shrink-0">Quitar</button>
+            </div>
+            <div className="text-[9px] font-semibold text-[#4C7C74] mt-1 uppercase tracking-wide">Vinculado a dotación (RRHH)</div>
+          </div>
+        ) : (
+          <div className="mb-2.5">
+            <label className="text-xs text-slate-600 font-medium block mb-1">Buscar en dotación (RRHH)</label>
+            <div className="relative">
+              <input
+                autoFocus
+                value={busqueda}
+                onChange={(e) => setBusqueda(e.target.value)}
+                placeholder="Escribe un nombre..."
+                className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm focus:outline-none"
+              />
+              {buscando && <Loader2 size={13} className="animate-spin absolute right-2.5 top-2.5 text-slate-400" />}
+              {resultados.length > 0 && (
+                <div className="absolute z-10 mt-1 w-full max-h-40 overflow-auto rounded-lg border border-slate-200 bg-white shadow-lg">
+                  {resultados.map((p) => (
+                    <button
+                      key={p.rut}
+                      onClick={() => elegirPersona(p)}
+                      className="w-full text-left px-2.5 py-1.5 hover:bg-slate-50 border-b border-slate-100 last:border-0"
+                    >
+                      <div className="text-xs text-slate-700">{p.nombreFuncionario}</div>
+                      <div className="text-[10px] text-slate-400">RUT {p.rut}{p.cargo ? ` · ${p.cargo}` : ''}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button onClick={() => setModoManual(true)} className="text-[10px] text-slate-400 hover:text-slate-600 mt-1">
+              No está en la dotación / escribir nombre manualmente
+            </button>
+          </div>
+        )}
+
+        {modoManual && !vinculado && (
+          <label className="text-xs text-slate-600 font-medium block mb-2.5">
+            Nombre
+            <input
+              value={nombre}
+              onChange={(e) => setNombre(e.target.value)}
+              placeholder="Ej: Dr./Dra. ..."
+              className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm focus:outline-none"
+            />
+          </label>
+        )}
+
         <label className="text-xs text-slate-600 font-medium block mb-2.5">
           Tipo de profesional
           <select value={tipo} onChange={(e) => setTipo(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm bg-white">
@@ -2509,7 +2650,7 @@ function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, nivelFormacionI
           onClick={() => {
             if (!nombre.trim()) return;
             const nivelFormacion = esBecado ? `Becado${nivelDetalle.trim() ? ` ${nivelDetalle.trim()}` : ''}` : '';
-            onConfirmar(nombre.trim(), tipo, nivelFormacion, tieneTurno);
+            onConfirmar(nombre.trim(), tipo, nivelFormacion, tieneTurno, rut);
           }}
           style={{ background: '#4C7C74' }}
           className="w-full text-white text-sm font-medium py-2 rounded-lg mt-3"
@@ -2560,9 +2701,9 @@ function AgendaCard({ agenda, onOpen }) {
           )}
         </div>
       </div>
-      <div className="mt-2.5 flex items-center justify-between text-xs text-slate-500">
-        <span>{total} hrs totales</span>
-        <span className="text-slate-400">{ultimoEvento ? `Act. ${ultimoEvento.fecha}` : 'Sin actividad registrada'}</span>
+      <div className="mt-2.5 flex items-center justify-between flex-wrap gap-x-2 gap-y-0.5 text-xs text-slate-500">
+        <span className="shrink-0">{total.toFixed(1)} hrs totales</span>
+        <span className="text-slate-400 truncate">{ultimoEvento ? `Act. ${ultimoEvento.fecha}` : 'Sin actividad registrada'}</span>
       </div>
     </button>
   );
@@ -3080,12 +3221,26 @@ function rendimientoPorPrestacion(bloques) {
     .sort((a, b) => b.horas - a.horas);
 }
 
-function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesTodosRaw, proyeccionTurno }) {
+function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesTodosRaw, proyeccionTurno, servicio }) {
   const [seleccion, setSeleccion] = useState([]); // [{ proceso, actividad }] — se pueden combinar varias prestaciones
   const [filtroBecados, setFiltroBecados] = useState('todos'); // 'todos' | 'sin' | 'solo'
   const [filtroTipoProfesional, setFiltroTipoProfesional] = useState('todos');
   const [filtroProfesional, setFiltroProfesional] = useState('todos');
   const [verHorasEfectivas, setVerHorasEfectivas] = useState(false);
+  const [capacidadPabellon, setCapacidadPabellon] = useState(null); // { cargado, grid } | null
+
+  // Disponibilidad real de infraestructura (por ahora solo pabellón) para este servicio, para
+  // cruzarla con lo programado en el heatmap en vez de usar siempre la capacidad genérica de
+  // referencia. Si el usuario no tiene acceso (ej. servicio de otro jefe) o no hay planilla
+  // cargada, simplemente no se ofrece — no es un error visible.
+  useEffect(() => {
+    let cancelado = false;
+    if (!servicio) { setCapacidadPabellon(null); return; }
+    fetchPabellonCapacidad(servicio)
+      .then((data) => { if (!cancelado) setCapacidadPabellon(data); })
+      .catch(() => { if (!cancelado) setCapacidadPabellon(null); });
+    return () => { cancelado = true; };
+  }, [servicio]);
   const hayProyeccionTurno = Array.isArray(proyeccionTurno) && proyeccionTurno.length > 0;
   const proyeccionPorNombre = new Map(
     (proyeccionTurno || []).map((p) => [p.professionalName.trim().toLowerCase(), p])
@@ -3137,6 +3292,11 @@ function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesT
     : bloques;
   const distribucionAgregada = distribucionDesdeBloquesProf(bloquesDistribucion);
   const paralelosPorBloque = paralelosDesdeBloquesProf(bloquesDistribucion);
+  // Cuando lo que se está mirando en el heatmap es específicamente pabellón, se usa la capacidad
+  // real (planilla de infraestructura) en vez de la genérica — mezclarla con otras prestaciones
+  // no tendría sentido porque la capacidad de pabellón no aplica a consultas, box, etc.
+  const esPabellonSeleccionado = seleccion.length > 0 && seleccion.every((s) => /pabellon/i.test(s.actividad || ''));
+  const usarCapacidadRealPabellon = esPabellonSeleccionado && capacidadPabellon?.cargado;
   const totalCupos = bloques.reduce((s, b) => s + cuposBloque(b), 0);
 
   const cuposNuevas = bloques.filter((b) => esConsultaNueva(b.actividad)).reduce((s, b) => s + cuposBloque(b), 0);
@@ -3327,49 +3487,71 @@ function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesT
           <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
             Distribución horaria{seleccion.length > 0 ? ` — ${seleccion.length === 1 ? `${seleccion[0].actividad} (${seleccion[0].proceso})` : `${seleccion.length} prestaciones seleccionadas`}` : ' de la agenda'}
           </div>
-          {seleccion.length > 0 && (
-            <button onClick={() => setSeleccion([])} className="text-[11px] text-[#4C7C74] hover:underline">
-              Ver todas las prestaciones
-            </button>
-          )}
-        </div>
-        <div className="bg-white rounded-xl border border-slate-200 p-3 overflow-x-auto">
-          <div style={{ display: 'grid', gridTemplateColumns: `40px repeat(${DIAS.length}, 34px)`, gap: 3, width: 'max-content' }}>
-            <div />
-            {DIAS.map((dia) => (
-              <div key={dia} className="text-[10px] text-slate-600 font-medium text-center">{dia.slice(0, 3)}</div>
-            ))}
-            {BLOQUES.map((b) => (
-              <React.Fragment key={b}>
-                <div className="text-[8px] text-slate-400 flex items-center justify-end pr-1">{b.slice(3, 5) === '00' ? b.slice(0, 2) : ''}</div>
-                {DIAS.map((dia) => {
-                  const horasProgramadas = distribucionAgregada[dia][b];
-                  const capacidad = INFRAESTRUCTURA_CAPACIDAD[dia][b];
-                  const pct = capacidad > 0 ? (horasProgramadas / capacidad) * 100 : (horasProgramadas > 0 ? 999 : 0);
-                  const color = heatColor(pct);
-                  const paralelos = paralelosPorBloque[dia][b];
-                  return (
-                    <div
-                      key={dia}
-                      title={`${dia} ${b} — ${horasProgramadas.toFixed(1)} / ${capacidad} hrs (${capacidad > 0 ? pct.toFixed(0) + '%' : 'sin capacidad'}) · ${paralelos} profesional${paralelos === 1 ? '' : 'es'} en paralelo`}
-                      style={{ background: color.bg, height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                    >
-                      {paralelos > 0 && (
-                        <span style={{ color: color.text, fontSize: 9, fontWeight: 600 }}>{paralelos}</span>
-                      )}
-                    </div>
-                  );
-                })}
-              </React.Fragment>
-            ))}
-          </div>
-          <div className="flex items-center gap-2 mt-3 px-1 max-w-xs">
-            <span className="text-[10px] text-slate-400">0%</span>
-            <div className="flex-1 h-2.5 rounded-full" style={{ background: 'linear-gradient(to right, hsl(165,62%,88%), hsl(82,62%,64%), hsl(41,62%,52%), hsl(0,62%,40%))' }} />
-            <span className="text-[10px] text-slate-400">≥130%</span>
+          <div className="flex items-center gap-2">
+            {esPabellonSeleccionado && (
+              usarCapacidadRealPabellon ? (
+                <span className="text-[10px] font-semibold text-[#2F6C5D] bg-[#EBF5F2] px-2 py-0.5 rounded-full">Capacidad real de pabellón</span>
+              ) : (
+                <span className="text-[10px] font-semibold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">Sin planilla de pabellón cargada — capacidad estimada</span>
+              )
+            )}
+            {seleccion.length > 0 && (
+              <button onClick={() => setSeleccion([])} className="text-[11px] text-[#4C7C74] hover:underline">
+                Ver todas las prestaciones
+              </button>
+            )}
           </div>
         </div>
-        <div className="text-[11px] text-slate-400 mt-1.5">Color = % de uso respecto a la capacidad de infraestructura (boxes/pabellones) disponible por día y bloque de 30 min. El número en cada celda es la cantidad de profesionales en paralelo. Pasa el mouse sobre una celda para ver el detalle.</div>
+        <div className={usarCapacidadRealPabellon ? 'flex flex-wrap gap-6 items-start' : ''}>
+          <div>
+            {usarCapacidadRealPabellon && <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">Programado</div>}
+            <div className="bg-white rounded-xl border border-slate-200 p-3 overflow-x-auto">
+              <div style={{ display: 'grid', gridTemplateColumns: `40px repeat(${DIAS.length}, 34px)`, gap: 3, width: 'max-content' }}>
+                <div />
+                {DIAS.map((dia) => (
+                  <div key={dia} className="text-[10px] text-slate-600 font-medium text-center">{dia.slice(0, 3)}</div>
+                ))}
+                {BLOQUES.map((b) => (
+                  <React.Fragment key={b}>
+                    <div className="text-[8px] text-slate-400 flex items-center justify-end pr-1">{b.slice(3, 5) === '00' ? b.slice(0, 2) : ''}</div>
+                    {DIAS.map((dia) => {
+                      const horasProgramadas = distribucionAgregada[dia][b];
+                      const pabellonesAsignados = usarCapacidadRealPabellon ? (capacidadPabellon.grid[dia]?.[b] ?? 0) : null;
+                      // Se convierte a horas (un pabellón asignado aporta 0.5 hrs de capacidad en un
+                      // bloque de 30 min) para poder compararlo en la misma unidad que horasProgramadas
+                      // y reusar exactamente la misma escala de color que la capacidad genérica.
+                      const capacidad = usarCapacidadRealPabellon ? pabellonesAsignados * 0.5 : INFRAESTRUCTURA_CAPACIDAD[dia][b];
+                      const pct = capacidad > 0 ? (horasProgramadas / capacidad) * 100 : (horasProgramadas > 0 ? 999 : 0);
+                      const color = heatColor(pct);
+                      const paralelos = paralelosPorBloque[dia][b];
+                      const detalleCapacidad = usarCapacidadRealPabellon
+                        ? `${pabellonesAsignados} pabellón${pabellonesAsignados === 1 ? '' : 'es'} asignado${pabellonesAsignados === 1 ? '' : 's'}`
+                        : `${capacidad} hrs (estimado)`;
+                      return (
+                        <div
+                          key={dia}
+                          title={`${dia} ${b} — ${horasProgramadas.toFixed(1)} hrs programadas / ${detalleCapacidad} (${capacidad > 0 ? pct.toFixed(0) + '%' : 'sin capacidad'}) · ${paralelos} profesional${paralelos === 1 ? '' : 'es'} en paralelo`}
+                          style={{ background: color.bg, height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                        >
+                          {paralelos > 0 && (
+                            <span style={{ color: color.text, fontSize: 9, fontWeight: 600 }}>{paralelos}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </React.Fragment>
+                ))}
+              </div>
+              <div className="flex items-center gap-2 mt-3 px-1 max-w-xs">
+                <span className="text-[10px] text-slate-400">0%</span>
+                <div className="flex-1 h-2.5 rounded-full" style={{ background: 'linear-gradient(to right, hsl(165,62%,88%), hsl(82,62%,64%), hsl(41,62%,52%), hsl(0,62%,40%))' }} />
+                <span className="text-[10px] text-slate-400">≥130%</span>
+              </div>
+            </div>
+            <div className="text-[11px] text-slate-400 mt-1.5">Color = % de uso respecto a la capacidad de infraestructura (boxes/pabellones) disponible por día y bloque de 30 min. El número en cada celda es la cantidad de profesionales en paralelo. Pasa el mouse sobre una celda para ver el detalle.</div>
+          </div>
+          {usarCapacidadRealPabellon && <CapacidadPabellonHeatmap grid={capacidadPabellon.grid} />}
+        </div>
       </div>
 
       <div>
@@ -3665,11 +3847,15 @@ function SustitucionesPanel({ rotacion, servicioId, profesionales, onCambio }) {
   const [fecha, setFecha] = useState('');
   const [profesionalId, setProfesionalId] = useState('');
   const [nota, setNota] = useState('');
+  const [dividido, setDividido] = useState(false);
+  const [profesionalNocheId, setProfesionalNocheId] = useState('');
   const [guardando, setGuardando] = useState(false);
 
   async function agregar() {
     if (!fecha || !profesionalId) return;
+    if (dividido && !profesionalNocheId) return;
     const prof = profesionales.find((p) => p.id === profesionalId);
+    const profNoche = dividido ? profesionales.find((p) => p.id === profesionalNocheId) : null;
     setGuardando(true);
     try {
       await createShiftOverride(servicioId, rotacion.id, {
@@ -3677,10 +3863,14 @@ function SustitucionesPanel({ rotacion, servicioId, profesionales, onCambio }) {
         professionalId,
         professionalName: prof?.nombre || '',
         note: nota.trim() || null,
+        splitProfessionalId: profNoche?.id || null,
+        splitProfessionalName: profNoche?.nombre || null,
       });
       setFecha('');
       setProfesionalId('');
       setNota('');
+      setDividido(false);
+      setProfesionalNocheId('');
       await onCambio();
     } finally {
       setGuardando(false);
@@ -3692,7 +3882,9 @@ function SustitucionesPanel({ rotacion, servicioId, profesionales, onCambio }) {
       <div className="space-y-1">
         {rotacion.overrides.map((o) => (
           <div key={o.id} className="flex items-center justify-between text-xs bg-slate-50 rounded-lg px-2.5 py-1.5">
-            <span className="text-slate-600">{formatoFechaCorta(o.date)} — {o.professionalName}{o.note ? ` (${o.note})` : ''}</span>
+            <span className="text-slate-600">
+              {formatoFechaCorta(o.date)} — {o.professionalName}{o.splitProfessionalName ? ` (día) / ${o.splitProfessionalName} (noche)` : ''}{o.note ? ` — ${o.note}` : ''}
+            </span>
             <button
               onClick={async () => { await deleteShiftOverride(servicioId, rotacion.id, o.id); await onCambio(); }}
               className="text-[#B6522F] hover:underline"
@@ -3703,17 +3895,27 @@ function SustitucionesPanel({ rotacion, servicioId, profesionales, onCambio }) {
         ))}
         {rotacion.overrides.length === 0 && <div className="text-[11px] text-slate-400 italic">Sin sustituciones.</div>}
       </div>
-      <div className="flex items-center gap-1.5 mt-2">
+      <div className="flex items-center gap-1.5 mt-2 flex-wrap">
         <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2 py-1.5" />
-        <select value={profesionalId} onChange={(e) => setProfesionalId(e.target.value)} className="flex-1 text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white">
-          <option value="">— Profesional —</option>
+        <select value={profesionalId} onChange={(e) => setProfesionalId(e.target.value)} className="flex-1 text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white min-w-[120px]">
+          <option value="">{dividido ? '— Cubre de día —' : '— Profesional —'}</option>
           {profesionales.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
         </select>
         <input value={nota} onChange={(e) => setNota(e.target.value)} placeholder="Nota (opcional)" className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 w-28" />
-        <button onClick={agregar} disabled={guardando || !fecha || !profesionalId} className="text-xs text-white px-2.5 py-1.5 rounded-lg disabled:opacity-40" style={{ background: '#4C7C74' }}>
+        <button onClick={agregar} disabled={guardando || !fecha || !profesionalId || (dividido && !profesionalNocheId)} className="text-xs text-white px-2.5 py-1.5 rounded-lg disabled:opacity-40" style={{ background: '#4C7C74' }}>
           Agregar
         </button>
       </div>
+      <label className="flex items-center gap-1.5 text-[11px] text-slate-500 mt-1.5 cursor-pointer">
+        <input type="checkbox" checked={dividido} onChange={(e) => setDividido(e.target.checked)} />
+        Cobertura dividida día/noche
+      </label>
+      {dividido && (
+        <select value={profesionalNocheId} onChange={(e) => setProfesionalNocheId(e.target.value)} className="mt-1 text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white w-full">
+          <option value="">— Cubre de noche —</option>
+          {profesionales.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+        </select>
+      )}
     </div>
   );
 }
@@ -3727,6 +3929,8 @@ function EditarTurnoDiaDialog({ edicion, servicioId, profesionales, onCancelar, 
   const overrideActual = rotacion.overrides.find((o) => o.date === fechaStr);
   const [profesionalId, setProfesionalId] = useState(entry?.professionalId || '');
   const [nota, setNota] = useState(overrideActual?.note || '');
+  const [dividido, setDividido] = useState(!!overrideActual?.splitProfessionalId || !!overrideActual?.splitProfessionalName);
+  const [profesionalNocheId, setProfesionalNocheId] = useState(overrideActual?.splitProfessionalId || '');
   const [guardando, setGuardando] = useState(false);
   const [error, setError] = useState('');
 
@@ -3740,11 +3944,19 @@ function EditarTurnoDiaDialog({ edicion, servicioId, profesionales, onCancelar, 
         setGuardando(false);
         return;
       }
+      const profNoche = dividido ? profesionales.find((p) => p.id === profesionalNocheId) : null;
+      if (dividido && !vacante && !profNoche) {
+        setError('Selecciona quién cubre la noche, o desactiva la cobertura dividida.');
+        setGuardando(false);
+        return;
+      }
       await createShiftOverride(servicioId, rotacion.id, {
         date: fechaStr,
         professionalId: prof?.id || null,
         professionalName: vacante ? 'Vacante' : prof.nombre,
         note: nota.trim() || null,
+        splitProfessionalId: profNoche?.id || null,
+        splitProfessionalName: profNoche?.nombre || null,
       });
       await onGuardado();
     } catch (e) {
@@ -3772,17 +3984,30 @@ function EditarTurnoDiaDialog({ edicion, servicioId, profesionales, onCancelar, 
         <div className="text-xs text-slate-500 mb-3 capitalize">{fecha.toLocaleDateString('es-CL', { weekday: 'long', day: 'numeric', month: 'long' })}</div>
         <div className="text-[11px] text-slate-500 bg-slate-50 rounded-lg px-2.5 py-1.5 mb-3">
           {entry?.professionalName ? (
-            <>Corresponde ahora: <strong>{entry.professionalName}</strong>{entry.esSustitucion ? ' (sustitución ya cargada)' : ' (por cálculo del ciclo)'}</>
+            <>Corresponde ahora{entry.tramoSplit ? ` (${entry.tramoSplit})` : ''}: <strong>{entry.professionalName}</strong>{entry.esSustitucion ? ' (sustitución ya cargada)' : ' (por cálculo del ciclo)'}</>
           ) : 'Puesto sin asignar todavía.'}
         </div>
         <label className="text-xs text-slate-600 font-medium block mb-2.5">
-          Profesional que cubre este día
+          {dividido ? 'Profesional que cubre de día (08:00-20:00)' : 'Profesional que cubre este día'}
           <select value={profesionalId} onChange={(e) => setProfesionalId(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm bg-white">
             <option value="">— Selecciona —</option>
             {profesionales.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
           </select>
         </label>
-        <label className="text-xs text-slate-600 font-medium block mb-3">
+        <label className="flex items-center gap-2 text-xs text-slate-600 font-medium py-1 cursor-pointer">
+          <input type="checkbox" checked={dividido} onChange={(e) => setDividido(e.target.checked)} />
+          Cobertura dividida día/noche (ej. feriado legal cubierto por 2 personas)
+        </label>
+        {dividido && (
+          <label className="text-xs text-slate-600 font-medium block mb-2.5 mt-1.5">
+            Profesional que cubre de noche (20:00-08:00)
+            <select value={profesionalNocheId} onChange={(e) => setProfesionalNocheId(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm bg-white">
+              <option value="">— Selecciona —</option>
+              {profesionales.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+            </select>
+          </label>
+        )}
+        <label className="text-xs text-slate-600 font-medium block mb-3 mt-1.5">
           Nota (opcional)
           <input value={nota} onChange={(e) => setNota(e.target.value)} placeholder="Ej: cambio por disponibilidad" className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm" />
         </label>
@@ -3905,20 +4130,20 @@ function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEdit
                     <div className="text-[11px] text-slate-400">{fecha.getDate()}</div>
                     <div className="space-y-0.5 mt-0.5">
                       {puestos.map((puesto, i) => {
-                        const entry = dia?.entries.find((e) => e.puesto === puesto);
-                        const rotacion = (datos.rotaciones || []).find((r) => r.puesto === puesto && r.unidad === entry?.unidad);
-                        const horario = entry
-                          ? `${hhmmDesdeMin(entry.startMinutes % 1440)}–${hhmmDesdeMin((entry.startMinutes + entry.durationMinutes) % 1440)}${entry.startMinutes + entry.durationMinutes > 1440 ? ' (+1)' : ''}`
-                          : '';
-                        const abrirEdicion = () => {
+                        // Un día con cobertura dividida (feriado legal cubierto día/noche por 2
+                        // personas) trae DOS entries para el mismo puesto — hay que mostrarlas
+                        // ambas, no solo la primera.
+                        const entradas = (dia?.entries || []).filter((e) => e.puesto === puesto);
+                        const rotacion = (datos.rotaciones || []).find((r) => r.puesto === puesto && r.unidad === entradas[0]?.unidad);
+                        const abrirEdicion = (entry) => {
                           if (!puedeEditar || !rotacion) return;
                           setEdicionDia({ fechaISO: fechaISO(fecha), fecha, unidad: rotacion.unidad, puesto, rotacion, entry: entry || null });
                         };
-                        if (!entry?.professionalName) {
+                        if (entradas.length === 0 || !entradas.some((e) => e.professionalName)) {
                           return rotacion ? (
                             <button
                               key={puesto}
-                              onClick={abrirEdicion}
+                              onClick={() => abrirEdicion(null)}
                               disabled={!puedeEditar}
                               className="w-full text-[10px] px-1 py-0.5 rounded truncate text-left text-slate-300 border border-dashed border-slate-200 hover:border-slate-300 hover:text-slate-400"
                             >
@@ -3926,19 +4151,24 @@ function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEdit
                             </button>
                           ) : null;
                         }
-                        const [primerNombre] = entry.professionalName.split(' ');
-                        return (
-                          <button
-                            key={puesto}
-                            onClick={abrirEdicion}
-                            disabled={!puedeEditar}
-                            title={`${puesto}: ${entry.professionalName} · ${horario}${entry.esSustitucion ? ' (sustitución)' : ''}${puedeEditar ? ' — clic para editar' : ''}`}
-                            className="w-full text-[10px] px-1 py-0.5 rounded truncate text-left hover:opacity-70"
-                            style={{ background: `${PUESTO_COLORES[i % PUESTO_COLORES.length]}1A`, color: PUESTO_COLORES[i % PUESTO_COLORES.length] }}
-                          >
-                            {primerNombre}{entry.esSustitucion && ' *'}
-                          </button>
-                        );
+                        return entradas.map((entry, ei) => {
+                          if (!entry.professionalName) return null;
+                          const horario = `${hhmmDesdeMin(entry.startMinutes % 1440)}–${hhmmDesdeMin((entry.startMinutes + entry.durationMinutes) % 1440)}${entry.startMinutes + entry.durationMinutes > 1440 ? ' (+1)' : ''}`;
+                          const [primerNombre] = entry.professionalName.split(' ');
+                          const etiquetaTramo = entry.tramoSplit === 'dia' ? ' (d)' : entry.tramoSplit === 'noche' ? ' (n)' : '';
+                          return (
+                            <button
+                              key={`${puesto}-${ei}`}
+                              onClick={() => abrirEdicion(entry)}
+                              disabled={!puedeEditar}
+                              title={`${puesto}: ${entry.professionalName} · ${horario}${entry.esSustitucion ? ' (sustitución)' : ''}${puedeEditar ? ' — clic para editar' : ''}`}
+                              className="w-full text-[10px] px-1 py-0.5 rounded truncate text-left hover:opacity-70"
+                              style={{ background: `${PUESTO_COLORES[i % PUESTO_COLORES.length]}1A`, color: PUESTO_COLORES[i % PUESTO_COLORES.length] }}
+                            >
+                              {primerNombre}{etiquetaTramo}{entry.esSustitucion && ' *'}
+                            </button>
+                          );
+                        });
                       })}
                     </div>
                   </div>
@@ -4137,7 +4367,11 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
     return () => { cancelled = true; };
   }, [servicioId]);
 
-  const hayRoster = roster?.dias?.some((d) => d.entries.some((e) => e.professionalName));
+  const puedeEditarTurno = role === 'jefe_servicio' || role === 'admin';
+  // Sin esto, un servicio que todavía no tiene ninguna rotación cargada nunca podría mostrar el
+  // botón "Nueva rotación" — el jefe de servicio necesita ver la pestaña para poder crear la
+  // primera. Un usuario de solo lectura solo la ve si ya hay turno real cargado.
+  const hayRoster = puedeEditarTurno || roster?.dias?.some((d) => d.entries.some((e) => e.professionalName));
   const profesional = profesionales.find((p) => p.id === activoId) || null;
   const soloLectura = !(role === 'jefe_servicio' && estado === 'borrador');
   const hayBecados = profesionales.some((p) => p.nivelFormacion);
@@ -4204,6 +4438,7 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
                 className={`flex-1 text-left px-3 py-2 truncate ${p.id === activoId ? 'text-slate-800' : 'text-slate-500'}`}
               >
                 <div className={`text-xs truncate ${p.id === activoId ? 'font-semibold' : ''}`}>
+                  {p.rut && <IdCard size={11} className="inline-block mr-1 -mt-0.5 text-[#4C7C74]" strokeWidth={2.2} />}
                   {p.nombre}
                   {p.nivelFormacion && (
                     <span className="ml-1.5 inline-block text-[9px] font-semibold text-[#7A5CC7] bg-[#F1EDFB] px-1.5 py-0.5 rounded-full align-middle">{p.nivelFormacion}</span>
@@ -4218,7 +4453,7 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
               </button>
               {!soloLectura && (
                 <button
-                  onClick={() => setDialogo({ tipo: 'editar', profesionalId: p.id, nombreInicial: p.nombre, tipoInicial: p.tipo, nivelFormacionInicial: p.nivelFormacion, tieneTurnoInicial: p.tieneTurno })}
+                  onClick={() => setDialogo({ tipo: 'editar', profesionalId: p.id, nombreInicial: p.nombre, tipoInicial: p.tipo, nivelFormacionInicial: p.nivelFormacion, tieneTurnoInicial: p.tieneTurno, rutInicial: p.rut })}
                   className="pr-2 text-slate-400 hover:text-[#4C7C74]"
                   title="Editar"
                 >
@@ -4243,9 +4478,10 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
               profesionales={profesionales}
               bloques={bloques}
               proyeccionTurno={roster?.proyeccion}
+              servicio={titulo}
             />
           ) : activoId === '__turno__' ? (
-            <TurnoRosterTab roster={roster} servicioId={servicioId} agendaId={agendaId} profesionales={profesionales} puedeEditar={role === 'jefe_servicio' || role === 'admin'} />
+            <TurnoRosterTab roster={roster} servicioId={servicioId} agendaId={agendaId} profesionales={profesionales} puedeEditar={puedeEditarTurno} />
           ) : !profesional ? (
             <div className="text-sm text-slate-400 italic text-center py-10">Sin profesionales cargados en esta agenda.</div>
           ) : (
@@ -4274,8 +4510,8 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
         <ProfesionalDialog
           titulo="Nuevo profesional"
           onCancelar={() => setDialogo(null)}
-          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno) => {
-            const nuevoId = await onAgregarProfesional(nombre, tipoProf, nivelFormacion, tieneTurno);
+          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut) => {
+            const nuevoId = await onAgregarProfesional(nombre, tipoProf, nivelFormacion, tieneTurno, rut);
             setActivoId(nuevoId);
             setDialogo(null);
           }}
@@ -4288,9 +4524,10 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
           tipoInicial={dialogo.tipoInicial}
           nivelFormacionInicial={dialogo.nivelFormacionInicial}
           tieneTurnoInicial={dialogo.tieneTurnoInicial}
+          rutInicial={dialogo.rutInicial}
           onCancelar={() => setDialogo(null)}
-          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno) => {
-            await onRenombrarProfesional(dialogo.profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno);
+          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut) => {
+            await onRenombrarProfesional(dialogo.profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno, rut);
             setDialogo(null);
           }}
         />
@@ -4577,19 +4814,25 @@ function NuevaAgendaModal({ servicio, jefeNombre, agendaBase, onClose, onCreate 
   const [vigenciaDesde, setVigenciaDesde] = useState('');
   const [vigenciaHasta, setVigenciaHasta] = useState('');
   const [usarBase, setUsarBase] = useState(!!agendaBase);
+  const [creando, setCreando] = useState(false);
   const clonBaseRef = useRef(agendaBase ? clonarProfesionalesYBloques(agendaBase) : null);
 
   function toggleUsarBase(checked) {
     setUsarBase(checked);
   }
 
-  function handleCrear() {
+  async function handleCrear() {
     const profesionales = usarBase && clonBaseRef.current ? clonBaseRef.current.profesionales : [];
     const bloques = usarBase && clonBaseRef.current ? clonBaseRef.current.bloques : [];
     const vigenciaLabel = vigenciaDesde && vigenciaHasta
       ? `${formatoFechaCorta(vigenciaDesde)} – ${formatoFechaCorta(vigenciaHasta)}`
       : (vigenciaDesde ? `Desde ${formatoFechaCorta(vigenciaDesde)}` : 'Vigencia sin definir');
-    onCreate(servicio, jefeNombre, horasDesdeBloquesProf(bloques), vigenciaLabel, null, null, distribucionDesdeBloquesProf(bloques), profesionales, bloques, vigenciaDesde, vigenciaHasta);
+    setCreando(true);
+    try {
+      await onCreate(servicio, jefeNombre, horasDesdeBloquesProf(bloques), vigenciaLabel, null, null, distribucionDesdeBloquesProf(bloques), profesionales, bloques, vigenciaDesde, vigenciaHasta);
+    } finally {
+      setCreando(false);
+    }
   }
 
   return (
@@ -4639,13 +4882,19 @@ function NuevaAgendaModal({ servicio, jefeNombre, agendaBase, onClose, onCreate 
         </div>
         <div className="px-5 py-4 shrink-0 border-t border-slate-100">
           <button
-            disabled={!vigenciaDesde}
+            disabled={!vigenciaDesde || creando}
             onClick={handleCrear}
             style={{ background: '#4C7C74' }}
-            className="w-full text-white text-sm font-medium py-2.5 rounded-lg disabled:opacity-40"
+            className="w-full flex items-center justify-center gap-1.5 text-white text-sm font-medium py-2.5 rounded-lg disabled:opacity-60"
           >
-            Crear agenda
+            {creando && <Loader2 size={14} className="animate-spin" />}
+            {creando ? 'Creando...' : 'Crear agenda'}
           </button>
+          {creando && usarBase && (
+            <div className="text-[10px] text-slate-400 text-center mt-1.5">
+              Copiando {clonBaseRef.current?.bloques.length || 0} actividades de la versión anterior, puede tardar unos segundos.
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -4720,14 +4969,78 @@ function DocsTab() {
   );
 }
 
+// Dropdown con checkboxes para elegir varios servicios a la vez (en vez de un <select> de una
+// sola opción) — se usa en el resumen general para poder combinar, por ejemplo, todas las
+// subespecialidades de un jefe que tiene más de un servicio a cargo.
+function FiltroMultiServicio({ servicios, seleccionados, onCambiar }) {
+  const [abierto, setAbierto] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    function onClickFuera(e) {
+      if (ref.current && !ref.current.contains(e.target)) setAbierto(false);
+    }
+    document.addEventListener('mousedown', onClickFuera);
+    return () => document.removeEventListener('mousedown', onClickFuera);
+  }, []);
+  const etiqueta =
+    seleccionados.length === 0
+      ? 'Todos los servicios'
+      : seleccionados.length === 1
+        ? seleccionados[0]
+        : `${seleccionados.length} servicios seleccionados`;
+  function toggle(s) {
+    onCambiar(seleccionados.includes(s) ? seleccionados.filter((x) => x !== s) : [...seleccionados, s]);
+  }
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setAbierto((v) => !v)}
+        className="text-xs rounded-lg border border-slate-300 px-2.5 py-1.5 bg-white flex items-center gap-1.5 max-w-[220px]"
+      >
+        <span className="truncate">{etiqueta}</span>
+        <ChevronDown size={12} className="shrink-0 text-slate-400" />
+      </button>
+      {abierto && (
+        <div className="absolute z-20 mt-1 w-64 max-h-72 overflow-y-auto bg-white rounded-lg border border-slate-200 shadow-lg p-1.5">
+          <div className="flex items-center justify-between px-1.5 py-1 border-b border-slate-100 mb-1">
+            <button onClick={() => onCambiar([])} className="text-[11px] text-[#4C7C74] hover:underline">Todos</button>
+            {seleccionados.length > 0 && (
+              <span className="text-[11px] text-slate-400">{seleccionados.length} seleccionado{seleccionados.length === 1 ? '' : 's'}</span>
+            )}
+          </div>
+          {servicios.map((s) => (
+            <label key={s} className="flex items-center gap-2 px-1.5 py-1 text-xs text-slate-700 hover:bg-slate-50 rounded cursor-pointer">
+              <input type="checkbox" checked={seleccionados.includes(s)} onChange={() => toggle(s)} />
+              <span className="truncate">{s}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ResumenDashboardTab({ agendas }) {
-  const [filtroServicio, setFiltroServicio] = useState('todos');
+  const [filtrosServicio, setFiltrosServicio] = useState([]); // [] = todos los servicios visibles
   const [filtroMes, setFiltroMes] = useState('todos');
   const [filtroEstado, setFiltroEstado] = useState('todos');
   const [filtroBecados, setFiltroBecados] = useState('todos'); // 'todos' | 'sin' | 'solo'
   const [filtroTipoProfesional, setFiltroTipoProfesional] = useState('todos');
   const [filtroProfesional, setFiltroProfesional] = useState('todos');
   const [seleccion, setSeleccion] = useState([]); // [{ proceso, actividad }] — se pueden combinar varias prestaciones
+  const [capacidadPabellon, setCapacidadPabellon] = useState(null); // { cargado, grid } | null
+
+  // La capacidad de pabellón es un concepto por servicio, así que solo se consulta cuando el
+  // filtro está acotado a UN servicio específico (no tiene sentido sumarla entre especialidades
+  // distintas que usan pabellones físicamente distintos).
+  useEffect(() => {
+    let cancelado = false;
+    if (filtrosServicio.length !== 1) { setCapacidadPabellon(null); return; }
+    fetchPabellonCapacidad(filtrosServicio[0])
+      .then((data) => { if (!cancelado) setCapacidadPabellon(data); })
+      .catch(() => { if (!cancelado) setCapacidadPabellon(null); });
+    return () => { cancelado = true; };
+  }, [filtrosServicio]);
 
   const servicios = useMemo(() => Array.from(new Set(agendas.map((a) => a.servicio))).sort(), [agendas]);
   const meses = useMemo(() => Array.from(new Set(agendas.map((a) => a.mes))).sort(), [agendas]);
@@ -4736,11 +5049,11 @@ function ResumenDashboardTab({ agendas }) {
     () =>
       agendas.filter(
         (a) =>
-          (filtroServicio === 'todos' || a.servicio === filtroServicio) &&
+          (filtrosServicio.length === 0 || filtrosServicio.includes(a.servicio)) &&
           (filtroMes === 'todos' || a.mes === filtroMes) &&
           (filtroEstado === 'todos' || a.estado === filtroEstado)
       ),
-    [agendas, filtroServicio, filtroMes, filtroEstado]
+    [agendas, filtrosServicio, filtroMes, filtroEstado]
   );
 
   const hayBecados = useMemo(() => filtradas.some((a) => a.profesionales.some((p) => p.nivelFormacion)), [filtradas]);
@@ -4833,6 +5146,8 @@ function ResumenDashboardTab({ agendas }) {
   );
   const distribucionAgregada = useMemo(() => distribucionDesdeBloquesProf(bloquesDistribucion), [bloquesDistribucion]);
   const paralelosPorBloque = useMemo(() => paralelosDesdeBloquesProf(bloquesDistribucion), [bloquesDistribucion]);
+  const esPabellonSeleccionado = seleccion.length > 0 && seleccion.every((s) => /pabellon/i.test(s.actividad || ''));
+  const usarCapacidadRealPabellon = esPabellonSeleccionado && filtrosServicio.length === 1 && capacidadPabellon?.cargado;
 
   const cuposNuevas = useMemo(() => todosBloques.filter((b) => esConsultaNueva(b.actividad)).reduce((s, b) => s + cuposBloque(b), 0), [todosBloques]);
   const cuposControles = useMemo(() => todosBloques.filter((b) => esConsultaControl(b.actividad)).reduce((s, b) => s + cuposBloque(b), 0), [todosBloques]);
@@ -4843,12 +5158,7 @@ function ResumenDashboardTab({ agendas }) {
   return (
     <div className="p-5 h-full overflow-y-auto space-y-5">
       <div className="flex flex-wrap gap-2">
-        <select value={filtroServicio} onChange={(e) => setFiltroServicio(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2.5 py-1.5 bg-white">
-          <option value="todos">Todos los servicios</option>
-          {servicios.map((s) => (
-            <option key={s} value={s}>{s}</option>
-          ))}
-        </select>
+        <FiltroMultiServicio servicios={servicios} seleccionados={filtrosServicio} onCambiar={setFiltrosServicio} />
         <select value={filtroMes} onChange={(e) => setFiltroMes(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2.5 py-1.5 bg-white">
           <option value="todos">Todos los meses</option>
           {meses.map((m) => (
@@ -4873,9 +5183,9 @@ function ResumenDashboardTab({ agendas }) {
             <option key={p.key} value={p.key}>{p.nombre} — {p.servicio}</option>
           ))}
         </select>
-        {(filtroServicio !== 'todos' || filtroMes !== 'todos' || filtroEstado !== 'todos' || filtroTipoProfesional !== 'todos' || filtroProfesional !== 'todos') && (
+        {(filtrosServicio.length > 0 || filtroMes !== 'todos' || filtroEstado !== 'todos' || filtroTipoProfesional !== 'todos' || filtroProfesional !== 'todos') && (
           <button
-            onClick={() => { setFiltroServicio('todos'); setFiltroMes('todos'); setFiltroEstado('todos'); setFiltroTipoProfesional('todos'); setFiltroProfesional('todos'); }}
+            onClick={() => { setFiltrosServicio([]); setFiltroMes('todos'); setFiltroEstado('todos'); setFiltroTipoProfesional('todos'); setFiltroProfesional('todos'); }}
             className="text-xs text-slate-400 hover:text-slate-600 underline px-1"
           >
             Limpiar filtros
@@ -5014,49 +5324,70 @@ function ResumenDashboardTab({ agendas }) {
           <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
             Distribución horaria vs. infraestructura disponible{seleccion.length > 0 ? ` — ${seleccion.length === 1 ? `${seleccion[0].actividad} (${seleccion[0].proceso})` : `${seleccion.length} prestaciones seleccionadas`}` : ''}
           </div>
-          {seleccion.length > 0 && (
-            <button onClick={() => setSeleccion([])} className="text-[11px] text-[#4C7C74] hover:underline">
-              Ver todas las prestaciones
-            </button>
-          )}
-        </div>
-        <div className="bg-white rounded-xl border border-slate-200 p-3 overflow-x-auto">
-          <div style={{ display: 'grid', gridTemplateColumns: `40px repeat(${DIAS.length}, 34px)`, gap: 3, width: 'max-content' }}>
-            <div />
-            {DIAS.map((dia) => (
-              <div key={dia} className="text-[10px] text-slate-600 font-medium text-center">{dia.slice(0, 3)}</div>
-            ))}
-            {BLOQUES.map((b) => (
-              <React.Fragment key={b}>
-                <div className="text-[8px] text-slate-400 flex items-center justify-end pr-1">{b.slice(3, 5) === '00' ? b.slice(0, 2) : ''}</div>
-                {DIAS.map((dia) => {
-                  const horasProgramadas = distribucionAgregada[dia][b];
-                  const capacidad = INFRAESTRUCTURA_CAPACIDAD[dia][b];
-                  const pct = capacidad > 0 ? (horasProgramadas / capacidad) * 100 : (horasProgramadas > 0 ? 999 : 0);
-                  const color = heatColor(pct);
-                  const paralelos = paralelosPorBloque[dia][b];
-                  return (
-                    <div
-                      key={dia}
-                      title={`${dia} ${b} — ${horasProgramadas.toFixed(1)} / ${capacidad} hrs (${capacidad > 0 ? pct.toFixed(0) + '%' : 'sin capacidad'}) · ${paralelos} profesional${paralelos === 1 ? '' : 'es'} en paralelo`}
-                      style={{ background: color.bg, height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                    >
-                      {paralelos > 0 && (
-                        <span style={{ color: color.text, fontSize: 9, fontWeight: 600 }}>{paralelos}</span>
-                      )}
-                    </div>
-                  );
-                })}
-              </React.Fragment>
-            ))}
-          </div>
-          <div className="flex items-center gap-2 mt-3 px-1 max-w-xs">
-            <span className="text-[10px] text-slate-400">0%</span>
-            <div className="flex-1 h-2.5 rounded-full" style={{ background: 'linear-gradient(to right, hsl(165,62%,88%), hsl(82,62%,64%), hsl(41,62%,52%), hsl(0,62%,40%))' }} />
-            <span className="text-[10px] text-slate-400">≥130%</span>
+          <div className="flex items-center gap-2">
+            {esPabellonSeleccionado && (
+              usarCapacidadRealPabellon ? (
+                <span className="text-[10px] font-semibold text-[#2F6C5D] bg-[#EBF5F2] px-2 py-0.5 rounded-full">Capacidad real de pabellón</span>
+              ) : filtrosServicio.length !== 1 ? (
+                <span className="text-[10px] font-semibold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">Filtra por un solo servicio para ver capacidad real</span>
+              ) : (
+                <span className="text-[10px] font-semibold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">Sin planilla de pabellón cargada — capacidad estimada</span>
+              )
+            )}
+            {seleccion.length > 0 && (
+              <button onClick={() => setSeleccion([])} className="text-[11px] text-[#4C7C74] hover:underline">
+                Ver todas las prestaciones
+              </button>
+            )}
           </div>
         </div>
-        <div className="text-[11px] text-slate-400 mt-1.5">Color = % de uso respecto a la capacidad de infraestructura (boxes/pabellones) disponible por día y bloque de 30 min. El número en cada celda es la cantidad de profesionales en paralelo. Pasa el mouse sobre una celda para ver el detalle. La capacidad es una referencia ajustable, no un dato real de infraestructura.</div>
+        <div className={usarCapacidadRealPabellon ? 'flex flex-wrap gap-6 items-start' : ''}>
+          <div>
+            {usarCapacidadRealPabellon && <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">Programado</div>}
+            <div className="bg-white rounded-xl border border-slate-200 p-3 overflow-x-auto">
+              <div style={{ display: 'grid', gridTemplateColumns: `40px repeat(${DIAS.length}, 34px)`, gap: 3, width: 'max-content' }}>
+                <div />
+                {DIAS.map((dia) => (
+                  <div key={dia} className="text-[10px] text-slate-600 font-medium text-center">{dia.slice(0, 3)}</div>
+                ))}
+                {BLOQUES.map((b) => (
+                  <React.Fragment key={b}>
+                    <div className="text-[8px] text-slate-400 flex items-center justify-end pr-1">{b.slice(3, 5) === '00' ? b.slice(0, 2) : ''}</div>
+                    {DIAS.map((dia) => {
+                      const horasProgramadas = distribucionAgregada[dia][b];
+                      const pabellonesAsignados = usarCapacidadRealPabellon ? (capacidadPabellon.grid[dia]?.[b] ?? 0) : null;
+                      const capacidad = usarCapacidadRealPabellon ? pabellonesAsignados * 0.5 : INFRAESTRUCTURA_CAPACIDAD[dia][b];
+                      const pct = capacidad > 0 ? (horasProgramadas / capacidad) * 100 : (horasProgramadas > 0 ? 999 : 0);
+                      const color = heatColor(pct);
+                      const paralelos = paralelosPorBloque[dia][b];
+                      const detalleCapacidad = usarCapacidadRealPabellon
+                        ? `${pabellonesAsignados} pabellón${pabellonesAsignados === 1 ? '' : 'es'} asignado${pabellonesAsignados === 1 ? '' : 's'}`
+                        : `${capacidad} hrs (estimado)`;
+                      return (
+                        <div
+                          key={dia}
+                          title={`${dia} ${b} — ${horasProgramadas.toFixed(1)} hrs programadas / ${detalleCapacidad} (${capacidad > 0 ? pct.toFixed(0) + '%' : 'sin capacidad'}) · ${paralelos} profesional${paralelos === 1 ? '' : 'es'} en paralelo`}
+                          style={{ background: color.bg, height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                        >
+                          {paralelos > 0 && (
+                            <span style={{ color: color.text, fontSize: 9, fontWeight: 600 }}>{paralelos}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </React.Fragment>
+                ))}
+              </div>
+              <div className="flex items-center gap-2 mt-3 px-1 max-w-xs">
+                <span className="text-[10px] text-slate-400">0%</span>
+                <div className="flex-1 h-2.5 rounded-full" style={{ background: 'linear-gradient(to right, hsl(165,62%,88%), hsl(82,62%,64%), hsl(41,62%,52%), hsl(0,62%,40%))' }} />
+                <span className="text-[10px] text-slate-400">≥130%</span>
+              </div>
+            </div>
+            <div className="text-[11px] text-slate-400 mt-1.5">Color = % de uso respecto a la capacidad de infraestructura (boxes/pabellones) disponible por día y bloque de 30 min. El número en cada celda es la cantidad de profesionales en paralelo. Pasa el mouse sobre una celda para ver el detalle. La capacidad es una referencia ajustable, no un dato real de infraestructura.</div>
+          </div>
+          {usarCapacidadRealPabellon && <CapacidadPabellonHeatmap grid={capacidadPabellon.grid} />}
+        </div>
       </div>
 
       <div>
@@ -5110,7 +5441,7 @@ function ResumenDashboardTab({ agendas }) {
                   <td className="px-3 py-2 text-slate-700">{a.servicio}</td>
                   <td className="px-3 py-2 text-slate-500">{a.mes}</td>
                   <td className="px-3 py-2"><Badge estado={a.estado} /></td>
-                  <td className="px-3 py-2 text-right text-slate-700 font-medium">{totalHorasAgenda(a.horas)}</td>
+                  <td className="px-3 py-2 text-right text-slate-700 font-medium">{totalHorasAgenda(a.horas).toFixed(1)}</td>
                   <td className="px-3 py-2 text-right text-slate-700 font-medium">{a.cnePct}%</td>
                 </tr>
               ))}
@@ -5307,6 +5638,497 @@ function UsuariosAdminTab({ users, services, onCreateUser }) {
   );
 }
 
+const HR_PLANTAS = ['MEDICOS', 'TECNICOS', 'PROFESIONALES', 'ADMINISTRATIVOS', 'AUXILIARES', 'FARMACEUTICOS', 'ODONTOLOGOS', 'DIRECTIVOS'];
+
+// Cruza el reporte de RRHH (Dotación) contra lo ya programado en la app: horas contratadas
+// (ley 19.664, sumadas entre TODOS los servicios donde aparece la persona) vs. horas
+// programadas (bloques de jornada ya cargados). El cruce se hace por RUT cuando el profesional
+// ya lo tiene guardado; si no, cae a coincidencia por nombre (marcada aparte, menos confiable).
+function RecursosHumanosTab({ resumen, cargando, error, planta, onCambiarPlanta, onSubirPlanilla }) {
+  const [subiendo, setSubiendo] = useState(false);
+  const [subidaError, setSubidaError] = useState('');
+  const [subidaOk, setSubidaOk] = useState('');
+  const fileInputRef = useRef(null);
+
+  async function manejarArchivo(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setSubiendo(true);
+    setSubidaError('');
+    setSubidaOk('');
+    try {
+      const result = await onSubirPlanilla(file);
+      setSubidaOk(`Se importaron ${result.filasImportadas} filas (hoja "${result.hoja}").`);
+    } catch (err) {
+      setSubidaError(err.message || 'No se pudo importar el archivo.');
+    } finally {
+      setSubiendo(false);
+    }
+  }
+
+  const items = resumen?.items || [];
+  const totalPendientes = items.reduce((s, i) => s + Math.max(0, i.horasPendientes), 0);
+  const sinAgendar = items.filter((i) => i.sinAgendar).length;
+
+  return (
+    <div className="h-full overflow-auto p-4 md:p-5 space-y-4">
+      <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <div className="text-sm font-semibold text-slate-800">Planilla de RRHH (Dotación)</div>
+            <div className="text-xs text-slate-500 mt-1">
+              {resumen?.ultimaImportacion
+                ? `Último corte cargado: ${new Date(resumen.ultimaImportacion).toLocaleString('es-CL')}`
+                : 'Todavía no se ha cargado ninguna planilla.'}
+            </div>
+          </div>
+          <div>
+            <input ref={fileInputRef} type="file" accept=".xlsx" className="hidden" onChange={manejarArchivo} />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={subiendo}
+              style={{ background: '#4C7C74' }}
+              className="flex items-center gap-1.5 rounded-xl px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50"
+            >
+              {subiendo ? <Loader2 size={14} className="animate-spin" /> : <UploadCloud size={14} />}
+              {subiendo ? 'Cargando...' : 'Cargar planilla RRHH'}
+            </button>
+          </div>
+        </div>
+        {subidaError && <div className="mt-3 rounded-xl bg-[#FBEEE8] px-3 py-2 text-xs text-[#B6522F]">{subidaError}</div>}
+        {subidaOk && <div className="mt-3 rounded-xl bg-[#EBF5F2] px-3 py-2 text-xs text-[#2F6C5D]">{subidaOk}</div>}
+        <div className="mt-3 text-[11px] text-slate-400">
+          Cada carga reemplaza por completo los datos anteriores — sube la planilla más reciente cada corte (mensual), no un histórico.
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[11px] text-slate-500">Planta:</span>
+        {HR_PLANTAS.map((p) => (
+          <button
+            key={p}
+            onClick={() => onCambiarPlanta(p)}
+            className={`text-xs px-2.5 py-1 rounded-full border ${planta === p ? 'bg-[#4C7C74] text-white border-[#4C7C74]' : 'bg-white text-slate-500 border-slate-300 hover:border-slate-400'}`}
+          >
+            {p.charAt(0) + p.slice(1).toLowerCase()}
+          </button>
+        ))}
+      </div>
+
+      {error && <div className="rounded-xl bg-[#FBEEE8] px-3 py-2 text-xs text-[#B6522F]">{error}</div>}
+
+      {!cargando && resumen && (
+        <div className="grid grid-cols-3 gap-3">
+          <div className="bg-white rounded-xl border border-slate-200 p-3">
+            <div className="text-[11px] text-slate-500">Personas con contrato vigente</div>
+            <div className="text-xl font-semibold text-slate-800 mt-0.5">{items.length}</div>
+          </div>
+          <div className="bg-white rounded-xl border border-slate-200 p-3">
+            <div className="text-[11px] text-slate-500">Sin ninguna hora programada</div>
+            <div className="text-xl font-semibold mt-0.5" style={{ color: sinAgendar > 0 ? '#B6522F' : '#1e293b' }}>{sinAgendar}</div>
+          </div>
+          <div className="bg-white rounded-xl border border-slate-200 p-3">
+            <div className="text-[11px] text-slate-500">Total horas pendientes por programar</div>
+            <div className="text-xl font-semibold mt-0.5" style={{ color: totalPendientes > 0 ? '#B6522F' : '#1e293b' }}>{totalPendientes.toFixed(1)}</div>
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <table className="w-full text-xs">
+          <thead className="bg-slate-50 text-slate-500">
+            <tr>
+              <th className="text-left px-3 py-2 font-medium">Nombre</th>
+              <th className="text-left px-3 py-2 font-medium">RUT</th>
+              <th className="text-left px-3 py-2 font-medium">Cargo / Unidad</th>
+              <th className="text-left px-3 py-2 font-medium">Servicio(s) programado(s)</th>
+              <th className="text-right px-3 py-2 font-medium">Contratadas</th>
+              <th className="text-right px-3 py-2 font-medium">Programadas</th>
+              <th className="text-right px-3 py-2 font-medium">Pendientes</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((i) => (
+              <tr key={i.rut} className="border-t border-slate-100">
+                <td className="px-3 py-1.5 text-slate-700">
+                  {i.nombre}
+                  {i.tieneTurno && <span className="ml-1.5 inline-block text-[10px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full">Turno</span>}
+                </td>
+                <td className="px-3 py-1.5 text-slate-500">{i.rut}-{i.dv}</td>
+                <td className="px-3 py-1.5 text-slate-500">{i.cargo || '—'}{i.unidad ? ` · ${i.unidad}` : ''}</td>
+                <td className="px-3 py-1.5 text-slate-500">
+                  {i.sinAgendar ? (
+                    <span className="text-[10px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full">Sin agendar</span>
+                  ) : (
+                    <>
+                      {i.servicios.join(', ')}
+                      {i.coincidenciaPorNombre && <span className="ml-1.5 text-[10px] text-slate-400 italic">(por nombre)</span>}
+                    </>
+                  )}
+                </td>
+                <td className="px-3 py-1.5 text-right text-slate-600">{i.horasContratadas.toFixed(1)}</td>
+                <td className="px-3 py-1.5 text-right text-slate-600">{i.horasProgramadas.toFixed(1)}</td>
+                <td className="px-3 py-1.5 text-right font-medium" style={{ color: i.horasPendientes > 0 ? '#B6522F' : '#1e293b' }}>{i.horasPendientes.toFixed(1)}</td>
+              </tr>
+            ))}
+            {cargando && (
+              <tr><td colSpan={7} className="px-3 py-6 text-center text-slate-400 italic">Cargando...</td></tr>
+            )}
+            {!cargando && items.length === 0 && (
+              <tr><td colSpan={7} className="px-3 py-6 text-center text-slate-400 italic">Sin datos — carga una planilla RRHH para empezar.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// "Comparación RRHH / Infraestructura" — hoy solo tiene el factor Pabellón, pero se arma con un
+// selector de factor desde el principio para que sumar los próximos (box, camas, etc.) sea
+// agregar una opción más acá, no rehacer la pestaña.
+const FACTORES_INFRAESTRUCTURA = [
+  { id: 'pabellon', label: 'Pabellón' },
+];
+
+function InfraestructuraTab({ resumenPabellon, cargandoPabellon, errorPabellon, onSubirPlanillaPabellon }) {
+  const [factor, setFactor] = useState('pabellon');
+
+  return (
+    <div className="h-full overflow-auto p-4 md:p-5 space-y-4">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[11px] text-slate-500">Factor productivo:</span>
+        {FACTORES_INFRAESTRUCTURA.map((f) => (
+          <button
+            key={f.id}
+            onClick={() => setFactor(f.id)}
+            className={`text-xs px-2.5 py-1 rounded-full border ${factor === f.id ? 'bg-[#4C7C74] text-white border-[#4C7C74]' : 'bg-white text-slate-500 border-slate-300 hover:border-slate-400'}`}
+          >
+            {f.label}
+          </button>
+        ))}
+        <span className="text-[11px] text-slate-400 italic">más factores próximamente</span>
+      </div>
+      {factor === 'pabellon' && (
+        <PabellonPanel
+          resumen={resumenPabellon}
+          cargando={cargandoPabellon}
+          error={errorPabellon}
+          onSubirPlanilla={onSubirPlanillaPabellon}
+        />
+      )}
+    </div>
+  );
+}
+
+// Color estable a partir de un texto (hash simple -> HSL) para pintar las celdas de la grilla
+// de pabellón por especialidad sin tener que mantener una paleta fija a mano.
+function colorParaTexto(texto) {
+  let hash = 0;
+  for (let i = 0; i < texto.length; i += 1) hash = (hash * 31 + texto.charCodeAt(i)) >>> 0;
+  const hue = hash % 360;
+  return { bg: `hsl(${hue}, 65%, 94%)`, border: `hsl(${hue}, 45%, 75%)`, text: `hsl(${hue}, 55%, 30%)` };
+}
+
+// Grilla visual de la planificación de pabellón, igual en estructura a la planilla original:
+// por grupo (ej. Cirugía Mayor Ambulatoria / Cirugía Mayor), filas = pabellón+jornada,
+// columnas = día, celda = especialidad asignada (coloreada).
+function GrillaPabellon({ grid }) {
+  if (!grid || grid.length === 0) return null;
+  return (
+    <div className="space-y-4">
+      {grid.map((g) => (
+        <div key={g.grupo} className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <div className="px-3 py-2 bg-slate-50 text-xs font-semibold text-slate-600 border-b border-slate-200">{g.grupo}</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-[11px]">
+              <thead className="text-slate-500">
+                <tr>
+                  <th className="text-left px-2 py-1.5 font-medium">Pabellón</th>
+                  <th className="text-left px-2 py-1.5 font-medium">Jornada</th>
+                  {g.dias.map((d) => (
+                    <th key={d} className="text-left px-2 py-1.5 font-medium">{d}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {g.pabellones.flatMap((pab) => ['Mañana', 'Tarde'].map((jornada) => {
+                  const key = `${pab}|||${jornada}`;
+                  const fila = g.celdas[key];
+                  if (!fila) return null;
+                  return (
+                    <tr key={key} className="border-t border-slate-100">
+                      <td className="px-2 py-1 text-slate-700 font-medium">{pab}</td>
+                      <td className="px-2 py-1 text-slate-500">{jornada}</td>
+                      {g.dias.map((d) => {
+                        const texto = fila[d];
+                        if (!texto) return <td key={d} className="px-2 py-1"></td>;
+                        const c = colorParaTexto(texto);
+                        return (
+                          <td key={d} className="px-1.5 py-1">
+                            <span
+                              className="inline-block rounded-md px-1.5 py-0.5 border text-[10px] leading-tight"
+                              style={{ background: c.bg, borderColor: c.border, color: c.text }}
+                            >
+                              {texto}
+                            </span>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                }))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Mini mapa de calor día×bloque-30min para comparar "planificado" vs "programado" en las mismas
+// unidades (horas), reutilizando heatColor (misma escala de color que el resto de la app). El
+// número en una celda "programado" es la cantidad de profesionales con bloque programado en ese
+// horario según la agenda semanal — se muestra a la vista, pero NO equivale a "pabellones
+// necesarios": la agenda es una plantilla semanal fija y no distingue si esos profesionales
+// realmente coinciden la misma semana o si rotan por el mismo pabellón (a confirmar con cada
+// servicio caso a caso).
+function MiniHeatmapGrid({ dias, bloques, valores, paralelos, maxReferencia, mostrarValor, enteros, unidad }) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: `34px repeat(${dias.length}, 30px)`, gap: 2, width: 'max-content' }}>
+      <div />
+      {dias.map((d) => (
+        <div key={d} className="text-[9px] text-slate-500 font-medium text-center">{d.slice(0, 3)}</div>
+      ))}
+      {bloques.map((b) => (
+        <React.Fragment key={b}>
+          <div className="text-[8px] text-slate-400 flex items-center justify-end pr-1">{b.endsWith(':00') ? b.slice(0, 2) : ''}</div>
+          {dias.map((d) => {
+            const valor = valores?.[d]?.[b] || 0;
+            // Piso de intensidad: cualquier celda con valor > 0 se ve claramente coloreada, no se
+            // deja que un máximo alto (ej. el lado "programado") deje pálido el lado "asignado".
+            const pct = valor > 0 && maxReferencia > 0 ? Math.max(35, (valor / maxReferencia) * 100) : 0;
+            const color = heatColor(pct);
+            const par = paralelos?.[d]?.[b] || 0;
+            const valorTexto = enteros ? String(Math.round(valor)) : valor.toFixed(1);
+            return (
+              <div
+                key={d}
+                title={`${d} ${b} — ${valorTexto} ${unidad || 'hrs'}${par ? ` · ${par} profesional${par === 1 ? '' : 'es'} con bloque programado (puede incluir rotación no capturada)` : ''}`}
+                style={{ background: valor > 0 ? color.bg : '#F8FAFC', height: 16, borderRadius: 3, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+              >
+                {par > 1 && <span style={{ color: color.text, fontSize: 8, fontWeight: 700 }}>{par}</span>}
+                {par <= 1 && mostrarValor && valor > 0 && <span style={{ color: color.text, fontSize: 7, fontWeight: 600 }}>{valorTexto}</span>}
+              </div>
+            );
+          })}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+// Cruza la planificación semanal de pabellón (qué especialidad tiene asignado cada pabellón,
+// por jornada y día) contra los bloques "Pabellon..." realmente programados en cada servicio.
+// La comparación es en HORAS, no en "pabellones simultáneos": un mismo pabellón puede operar
+// legítimamente con 2-3 cirujanos a la vez, así que contar profesionales en paralelo como si cada
+// uno ocupara un pabellón distinto sobreestima la brecha. En horas esa concurrencia deja de ser un
+// problema (las horas de cada profesional simplemente se suman) y el número de profesionales en
+// paralelo se muestra aparte en la grilla, a la vista, para que se pueda juzgar si es normal.
+function PabellonPanel({ resumen, cargando, error, onSubirPlanilla }) {
+  const [subiendo, setSubiendo] = useState(false);
+  const [subidaError, setSubidaError] = useState('');
+  const [subidaOk, setSubidaOk] = useState('');
+  const [detalleAbierto, setDetalleAbierto] = useState(null);
+  const [mostrarGrilla, setMostrarGrilla] = useState(false);
+  const fileInputRef = useRef(null);
+
+  async function manejarArchivo(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setSubiendo(true);
+    setSubidaError('');
+    setSubidaOk('');
+    try {
+      const result = await onSubirPlanilla(file);
+      setSubidaOk(`Se importaron ${result.filasImportadas} asignaciones (hoja "${result.hoja}").`);
+    } catch (err) {
+      setSubidaError(err.message || 'No se pudo importar el archivo.');
+    } finally {
+      setSubiendo(false);
+    }
+  }
+
+  const items = resumen?.items || [];
+  const dias = resumen?.dias || [];
+  const bloques = resumen?.bloques || [];
+  const totalAsignadas = items.reduce((s, i) => s + i.horasAsignadas, 0);
+  const totalProgramadas = items.reduce((s, i) => s + (i.cargado ? i.horasProgramadas : 0), 0);
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-2xl border border-slate-200 bg-white p-4">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <div className="text-sm font-semibold text-slate-800">Planificación de pabellón</div>
+            <div className="text-xs text-slate-500 mt-1">
+              {resumen?.ultimaImportacion
+                ? `Última planilla cargada: ${new Date(resumen.ultimaImportacion).toLocaleString('es-CL')}`
+                : 'Todavía no se ha cargado ninguna planilla de pabellón.'}
+            </div>
+          </div>
+          <div>
+            <input ref={fileInputRef} type="file" accept=".xlsx" className="hidden" onChange={manejarArchivo} />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={subiendo}
+              style={{ background: '#4C7C74' }}
+              className="flex items-center gap-1.5 rounded-xl px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50"
+            >
+              {subiendo ? <Loader2 size={14} className="animate-spin" /> : <UploadCloud size={14} />}
+              {subiendo ? 'Cargando...' : 'Cargar planilla de pabellón'}
+            </button>
+          </div>
+        </div>
+        {subidaError && <div className="mt-3 rounded-xl bg-[#FBEEE8] px-3 py-2 text-xs text-[#B6522F]">{subidaError}</div>}
+        {subidaOk && <div className="mt-3 rounded-xl bg-[#EBF5F2] px-3 py-2 text-xs text-[#2F6C5D]">{subidaOk}</div>}
+        <div className="mt-3 text-[11px] text-slate-400">
+          Cada carga reemplaza por completo la planificación anterior. La comparación es en horas:
+          "asignadas" son las horas de pabellón que la planilla le da a la especialidad (jornada
+          Mañana/Tarde asumida en ventanas estándar, ya que la planilla no trae hora exacta);
+          "programadas" son las horas reales cargadas en la agenda.
+        </div>
+        <div className="mt-2 rounded-xl bg-[#FBF6E8] px-3 py-2 text-[11px] text-[#8A6C1E]">
+          Ojo: la agenda registra un bloque semanal fijo por profesional (ej. "Lunes mañana Pabellón"),
+          pero no distingue si ese profesional está realmente esa semana o si rota con otros por el
+          mismo pabellón. Si en un bloque aparecen más profesionales "en paralelo" que pabellones
+          asignados, puede ser rotación no capturada por la app (revisar con el servicio) y no
+          necesariamente una sobre-programación real.
+        </div>
+      </div>
+
+      {error && <div className="rounded-xl bg-[#FBEEE8] px-3 py-2 text-xs text-[#B6522F]">{error}</div>}
+
+      {items.length > 0 && (
+        <div className="grid grid-cols-3 gap-3">
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">Horas asignadas / sem.</div>
+            <div className="text-xl font-semibold text-slate-800 mt-1">{totalAsignadas.toFixed(1)} hrs</div>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">Horas programadas / sem.</div>
+            <div className="text-xl font-semibold text-slate-800 mt-1">{totalProgramadas.toFixed(1)} hrs</div>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">Diferencia</div>
+            <div className="text-xl font-semibold mt-1" style={{ color: totalProgramadas - totalAsignadas !== 0 ? '#B6522F' : '#1e293b' }}>
+              {totalProgramadas - totalAsignadas > 0 ? '+' : ''}{(totalProgramadas - totalAsignadas).toFixed(1)} hrs
+            </div>
+          </div>
+        </div>
+      )}
+
+      {resumen?.grid?.length > 0 && (
+        <div>
+          <button
+            onClick={() => setMostrarGrilla((v) => !v)}
+            className="text-xs font-medium text-[#4C7C74] hover:underline flex items-center gap-1"
+          >
+            {mostrarGrilla ? '▲' : '▼'} {mostrarGrilla ? 'Ocultar' : 'Ver'} planificación de pabellón (grilla original)
+          </button>
+          {mostrarGrilla && <div className="mt-2"><GrillaPabellon grid={resumen.grid} /></div>}
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <table className="w-full text-xs">
+          <thead className="bg-slate-50 text-slate-500">
+            <tr>
+              <th className="text-left px-3 py-2 font-medium">Especialidad</th>
+              <th className="text-right px-3 py-2 font-medium">Horas asignadas / sem.</th>
+              <th className="text-right px-3 py-2 font-medium">Horas programadas / sem.</th>
+              <th className="text-right px-3 py-2 font-medium">Diferencia</th>
+              <th className="w-8"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((i) => {
+              const expandido = detalleAbierto === i.servicio;
+              return (
+                <React.Fragment key={i.servicio}>
+                  <tr
+                    className="border-t border-slate-100 cursor-pointer hover:bg-slate-50/60"
+                    onClick={() => setDetalleAbierto(expandido ? null : i.servicio)}
+                  >
+                    <td className="px-3 py-1.5 text-slate-700">
+                      {i.servicio}
+                      {!i.cargado && <span className="ml-1.5 inline-block text-[10px] font-semibold text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded-full">No cargado aún</span>}
+                    </td>
+                    <td className="px-3 py-1.5 text-right text-slate-600">{i.horasAsignadas.toFixed(1)} hrs</td>
+                    <td className="px-3 py-1.5 text-right text-slate-600">{i.cargado ? `${i.horasProgramadas.toFixed(1)} hrs` : '—'}</td>
+                    <td className="px-3 py-1.5 text-right font-medium" style={{ color: i.cargado && i.diferenciaHoras !== 0 ? '#B6522F' : '#1e293b' }}>
+                      {i.cargado ? `${i.diferenciaHoras > 0 ? '+' : ''}${i.diferenciaHoras.toFixed(1)} hrs` : '—'}
+                    </td>
+                    <td className="px-2 text-center text-slate-400">{expandido ? '▲' : '▼'}</td>
+                  </tr>
+                  {expandido && (
+                    <tr className="border-t border-slate-100 bg-slate-50/50">
+                      <td colSpan={5} className="px-3 py-3 space-y-4">
+                        {(i.grupos || []).map((g) => {
+                          const maxAsignado = Math.max(1, ...dias.flatMap((d) => bloques.map((b) => g.gridAsignado?.[d]?.[b] || 0)));
+                          const maxProgramado = Math.max(1, ...dias.flatMap((d) => bloques.map((b) => g.gridProgramado?.[d]?.[b] || 0)));
+                          return (
+                            <div key={g.grupo}>
+                              <div className="text-xs font-semibold text-slate-600 mb-2">{g.grupo}</div>
+                              <div className="flex flex-wrap gap-6">
+                                <div>
+                                  <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">Asignado (planilla) — {g.horasAsignadas.toFixed(1)} hrs/sem.</div>
+                                  <MiniHeatmapGrid dias={dias} bloques={bloques} valores={g.gridAsignado} maxReferencia={maxAsignado} mostrarValor enteros unidad="pabellón(es)" />
+                                </div>
+                                <div>
+                                  <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">Programado (agenda real) — {g.horasProgramadas.toFixed(1)} hrs/sem.</div>
+                                  <MiniHeatmapGrid dias={dias} bloques={bloques} valores={g.gridProgramado} paralelos={g.gridParalelos} maxReferencia={maxProgramado} />
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                        {(!i.grupos || i.grupos.length === 0) && (
+                          <div className="text-[11px] text-slate-400 italic">Sin asignaciones de pabellón para esta especialidad.</div>
+                        )}
+                        {i.horasProgramadasSinGrupo > 0 && (
+                          <div className="text-[11px] text-[#B6522F]">
+                            {i.horasProgramadasSinGrupo.toFixed(1)} hrs/sem. programadas con actividad "Pabellon..." que no calzan con ninguno de los grupos de la planilla (nombre de actividad distinto) — no están incluidas arriba.
+                          </div>
+                        )}
+                        <div className="text-[10px] text-slate-400">
+                          Cada grilla usa su propia escala de color (el color no se compara 1 a 1 entre ambas). El número "asignado" es la cantidad de pabellones de ese grupo asignados en el bloque; en "programado" es la cantidad de profesionales con bloque programado ese horario — no confirma que todos coincidan la misma semana si el servicio rota por los pabellones. Pasa el mouse sobre una celda para ver el detalle exacto.
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+            {cargando && (
+              <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400 italic">Cargando...</td></tr>
+            )}
+            {!cargando && items.length === 0 && (
+              <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400 italic">Sin datos — carga una planilla de pabellón para empezar.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div className="text-[11px] text-slate-400">
+        Diferencia = horas programadas − horas asignadas. Positivo: el servicio programa más horas de pabellón de las que tiene asignadas. Negativo: le queda pabellón asignado sin usar. Haz clic en una fila para ver el mapa de bloques del detalle.
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [role, setRole] = useState('jefe_servicio');
   const [miServicio, setMiServicio] = useState(SERVICIOS[0]);
@@ -5330,6 +6152,13 @@ export default function App() {
   const [notifs, setNotifs] = useState([]);
   const [resumenLoading, setResumenLoading] = useState(false);
   const [usersCatalog, setUsersCatalog] = useState([]);
+  const [resumenRrhh, setResumenRrhh] = useState(null);
+  const [cargandoRrhh, setCargandoRrhh] = useState(false);
+  const [errorRrhh, setErrorRrhh] = useState('');
+  const [plantaRrhh, setPlantaRrhh] = useState('MEDICOS');
+  const [resumenPabellon, setResumenPabellon] = useState(null);
+  const [cargandoPabellon, setCargandoPabellon] = useState(false);
+  const [errorPabellon, setErrorPabellon] = useState('');
 
   async function hydrateAuthenticatedApp(sessionUser = null) {
     const currentUser = sessionUser || (await fetchMe()).user;
@@ -5462,6 +6291,58 @@ export default function App() {
     return created;
   }
 
+  const HR_ROLES = ['admin', 'subdirector', 'referente_programacion'];
+
+  async function refreshHrSummary(planta) {
+    if (!authUser || !HR_ROLES.includes(authUser.role)) return;
+    setCargandoRrhh(true);
+    setErrorRrhh('');
+    try {
+      const data = await fetchHrSummary({ planta: planta || plantaRrhh });
+      setResumenRrhh(data);
+    } catch (err) {
+      setErrorRrhh(err.message || 'No se pudo cargar el resumen de RRHH.');
+    } finally {
+      setCargandoRrhh(false);
+    }
+  }
+
+  async function handleUploadHrDotacion(file) {
+    const result = await uploadHrDotacion(file);
+    await refreshHrSummary();
+    return result;
+  }
+
+  useEffect(() => {
+    if (tab === 'rrhh') refreshHrSummary(plantaRrhh);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, plantaRrhh]);
+
+  async function refreshPabellonSummary() {
+    if (!authUser || !HR_ROLES.includes(authUser.role)) return;
+    setCargandoPabellon(true);
+    setErrorPabellon('');
+    try {
+      const data = await fetchPabellonSummary();
+      setResumenPabellon(data);
+    } catch (err) {
+      setErrorPabellon(err.message || 'No se pudo cargar la planificación de pabellón.');
+    } finally {
+      setCargandoPabellon(false);
+    }
+  }
+
+  async function handleUploadPabellonPlan(file) {
+    const result = await uploadPabellonPlan(file);
+    await refreshPabellonSummary();
+    return result;
+  }
+
+  useEffect(() => {
+    if (tab === 'infraestructura') refreshPabellonSummary();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+
   async function refreshNotifications() {
     try {
       const notifications = await fetchNotifications();
@@ -5479,6 +6360,11 @@ export default function App() {
         return a;
       });
       setSelected((s) => (s ? { ...s, cnePct: payload.valor } : s));
+      try {
+        await updateAgendaFields(agenda.id, { cnePct: payload.valor });
+      } catch (_error) {
+        setSyncLabel('No se pudo guardar el %CNE en el servidor.');
+      }
       return;
     }
     if (action === 'editar_atenciones') {
@@ -5488,15 +6374,29 @@ export default function App() {
         return a;
       });
       setSelected((s) => (s ? { ...s, atenciones: payload.valor } : s));
+      try {
+        await updateAgendaFields(agenda.id, { atenciones: payload.valor });
+      } catch (_error) {
+        setSyncLabel('No se pudo guardar las atenciones en el servidor.');
+      }
       return;
     }
     if (action === 'editar_distribucion') {
+      const nuevaDistribucion = {
+        ...agenda.distribucionHoraria,
+        [payload.dia]: { ...agenda.distribucionHoraria[payload.dia], [payload.bloque]: payload.valor },
+      };
       updateAgenda(agenda.id, (a) => {
         a.distribucionHoraria = { ...a.distribucionHoraria, [payload.dia]: { ...a.distribucionHoraria[payload.dia], [payload.bloque]: payload.valor } };
         a.lastUpdated = Date.now();
         return a;
       });
       setSelected((s) => (s ? { ...s, distribucionHoraria: { ...s.distribucionHoraria, [payload.dia]: { ...s.distribucionHoraria[payload.dia], [payload.bloque]: payload.valor } } } : s));
+      try {
+        await updateAgendaFields(agenda.id, { distribucionHoraria: nuevaDistribucion });
+      } catch (_error) {
+        setSyncLabel('No se pudo guardar la distribución horaria en el servidor.');
+      }
       return;
     }
     if (action === 'agregar_profesional') {
@@ -5507,6 +6407,7 @@ export default function App() {
         tipo: payload.tipo || TIPOS_PROFESIONAL[0],
         nivelFormacion: payload.nivelFormacion || null,
         tieneTurno: payload.tieneTurno || false,
+        rut: payload.rut || null,
       });
       await refreshAgendaState(agenda.id);
       return newId;
@@ -5527,6 +6428,7 @@ export default function App() {
         tipo: payload.tipo,
         nivelFormacion: payload.nivelFormacion,
         tieneTurno: payload.tieneTurno,
+        rut: payload.rut ?? null,
       });
       await refreshAgendaState(agenda.id);
       return;
@@ -5750,6 +6652,8 @@ export default function App() {
           { id: 'resumen', label: 'Resumen de Horas', icon: BarChart3 },
           { id: 'historial', label: 'Historial', icon: History },
           ...(role === 'admin' ? [{ id: 'usuarios', label: 'Usuarios', icon: Users }] : []),
+          ...(HR_ROLES.includes(role) ? [{ id: 'rrhh', label: 'Recursos Humanos', icon: IdCard }] : []),
+          ...(HR_ROLES.includes(role) ? [{ id: 'infraestructura', label: 'Infraestructura', icon: Building2 }] : []),
           { id: 'docs', label: 'Documentos normativos', icon: FileText },
           { id: 'chat', label: 'Chat IA', icon: MessageSquare },
         ].map((t) => (
@@ -5798,6 +6702,24 @@ export default function App() {
             users={usersCatalog}
             services={services}
             onCreateUser={handleCreateUser}
+          />
+        )}
+        {tab === 'rrhh' && HR_ROLES.includes(role) && (
+          <RecursosHumanosTab
+            resumen={resumenRrhh}
+            cargando={cargandoRrhh}
+            error={errorRrhh}
+            planta={plantaRrhh}
+            onCambiarPlanta={setPlantaRrhh}
+            onSubirPlanilla={handleUploadHrDotacion}
+          />
+        )}
+        {tab === 'infraestructura' && HR_ROLES.includes(role) && (
+          <InfraestructuraTab
+            resumenPabellon={resumenPabellon}
+            cargandoPabellon={cargandoPabellon}
+            errorPabellon={errorPabellon}
+            onSubirPlanillaPabellon={handleUploadPabellonPlan}
           />
         )}
         {tab === 'docs' && <DocsTab />}
@@ -5871,12 +6793,12 @@ export default function App() {
             await handleAction('enviar', agendaEnEditor);
             setShowEditorFor(null);
           }}
-          onAgregarProfesional={async (nombre, tipoProf, nivelFormacion, tieneTurno) => {
+          onAgregarProfesional={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut) => {
             const nuevoId = nuevoProfesionalId();
-            return handleAction('agregar_profesional', agendaEnEditor, { nombre, tipo: tipoProf, nivelFormacion, tieneTurno, idPrefijado: nuevoId });
+            return handleAction('agregar_profesional', agendaEnEditor, { nombre, tipo: tipoProf, nivelFormacion, tieneTurno, rut, idPrefijado: nuevoId });
           }}
           onEliminarProfesional={async (profesionalId) => handleAction('quitar_profesional', agendaEnEditor, { profesionalId })}
-          onRenombrarProfesional={async (profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno) => handleAction('renombrar_profesional', agendaEnEditor, { profesionalId, nombre, tipo: tipoProf, nivelFormacion, tieneTurno })}
+          onRenombrarProfesional={async (profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno, rut) => handleAction('renombrar_profesional', agendaEnEditor, { profesionalId, nombre, tipo: tipoProf, nivelFormacion, tieneTurno, rut })}
           onLimpiarProfesional={async (profesionalId) => handleAction('limpiar_bloques_profesional', agendaEnEditor, { profesionalId })}
           onAgregarBloque={(profesionalId, anterior, siguiente) => {
             const valores = calcularInsercion(anterior, siguiente);

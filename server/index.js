@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import cors from 'cors';
 import express from 'express';
+import multer from 'multer';
 import { fileURLToPath } from 'url';
 import { PrismaClient } from '@prisma/client';
 import {
@@ -20,6 +21,40 @@ import {
   toAgendaStatus,
   writeAgendaGraph,
 } from './lib/agendas.js';
+import { normalizeRut, normalizeText, parseDotacionWorkbook } from './lib/hr.js';
+import { parsePabellonWorkbook, resolveServiciosDesdeTexto } from './lib/pabellon.js';
+
+// Grilla día×bloque-30min compartida entre /api/pabellon/summary y /api/pabellon/capacidad —
+// misma estructura (Lunes-Sábado, 08:00-20:00) que usa el heatmap de "Distribución horaria" en
+// el frontend, para que la capacidad real de pabellón se pueda cruzar celda a celda con lo
+// programado.
+const DIAS_SEMANA = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+const HORA_INICIO_GRID = 8;
+const HORA_FIN_GRID = 20;
+const BLOQUES_GRID = [];
+for (let m = HORA_INICIO_GRID * 60; m < HORA_FIN_GRID * 60; m += 30) {
+  BLOQUES_GRID.push(`${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`);
+}
+// Ventana estándar asumida por jornada (la planilla de pabellón no trae hora exacta de
+// inicio/término, solo "Mañana"/"Tarde") — se usa únicamente para dibujar el bloque asignado y
+// estimar horas asignadas; es una aproximación declarada como tal en la UI.
+const VENTANA_JORNADA = { 'Mañana': [8 * 60, 13 * 60], 'Tarde': [14 * 60, 18 * 60] };
+
+function gridVacia() {
+  const g = {};
+  DIAS_SEMANA.forEach((dia) => { g[dia] = {}; BLOQUES_GRID.forEach((b) => { g[dia][b] = 0; }); });
+  return g;
+}
+
+function agregarAGrid(grid, dia, inicioMin, finMin, valorPorBloque) {
+  if (!grid[dia]) return;
+  BLOQUES_GRID.forEach((label, idx) => {
+    const cellStart = HORA_INICIO_GRID * 60 + idx * 30;
+    const cellEnd = cellStart + 30;
+    const overlap = Math.min(finMin, cellEnd) - Math.max(inicioMin, cellStart);
+    if (overlap > 0) grid[dia][label] += typeof valorPorBloque === 'function' ? valorPorBloque(overlap) : valorPorBloque;
+  });
+}
 
 const prisma = new PrismaClient({
   transactionOptions: {
@@ -149,18 +184,60 @@ function dateOnlyUTC(date) {
 // Calcula quién corresponde en una rotación de turno para una fecha dada: primero busca un
 // override puntual para esa fecha exacta; si no hay, deriva la posición del ciclo con
 // (fecha - anchorDate) mod cycleDays (doble módulo para cubrir fechas anteriores al ancla).
+// Devuelve un arreglo (1 o 2 elementos) en vez de un solo resuelto: un override "dividido"
+// (cobertura de feriado legal por 2 personas) reemplaza el turno completo de 24h por dos
+// sub-turnos de 12h (día 08:00-20:00 / noche 20:00-08:00), cada uno con su propio profesional.
+// El resto de la app (roster, conteos, cruce con jornada) itera este arreglo sin distinguir si
+// hubo split o no — cada entrada ya trae su propio startMinutes/durationMinutes.
+const SPLIT_DIA_START = 8 * 60;
+const SPLIT_DIA_DURACION = 12 * 60;
+const SPLIT_NOCHE_START = 20 * 60;
+const SPLIT_NOCHE_DURACION = 12 * 60;
+
 function resolveShiftForDate(rotation, date) {
   const target = dateOnlyUTC(date);
   const override = rotation.overrides.find((o) => dateOnlyUTC(o.date) === target);
   if (override) {
-    return { professionalId: override.professionalId, professionalName: override.professionalName, isOverride: true };
+    if (override.splitProfessionalId || override.splitProfessionalName) {
+      return [
+        {
+          professionalId: override.professionalId,
+          professionalName: override.professionalName,
+          isOverride: true,
+          startMinutes: SPLIT_DIA_START,
+          durationMinutes: SPLIT_DIA_DURACION,
+          tramoSplit: 'dia',
+        },
+        {
+          professionalId: override.splitProfessionalId,
+          professionalName: override.splitProfessionalName,
+          isOverride: true,
+          startMinutes: SPLIT_NOCHE_START,
+          durationMinutes: SPLIT_NOCHE_DURACION,
+          tramoSplit: 'noche',
+        },
+      ];
+    }
+    return [{
+      professionalId: override.professionalId,
+      professionalName: override.professionalName,
+      isOverride: true,
+      startMinutes: rotation.startMinutes,
+      durationMinutes: rotation.durationMinutes,
+    }];
   }
   const anchor = dateOnlyUTC(rotation.anchorDate);
   const diffDays = Math.round((target - anchor) / (24 * 60 * 60 * 1000));
   const position = ((diffDays % rotation.cycleDays) + rotation.cycleDays) % rotation.cycleDays;
   const member = rotation.members.find((m) => m.position === position);
-  if (!member) return null;
-  return { professionalId: member.professionalId, professionalName: member.professionalName, isOverride: false };
+  if (!member) return [];
+  return [{
+    professionalId: member.professionalId,
+    professionalName: member.professionalName,
+    isOverride: false,
+    startMinutes: rotation.startMinutes,
+    durationMinutes: rotation.durationMinutes,
+  }];
 }
 
 function mapCatalogActivity(row) {
@@ -724,6 +801,408 @@ app.post('/api/users', async (req, res) => {
   }
 });
 
+const HR_ROLES = ['admin', 'subdirector', 'referente_programacion'];
+const hrUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+
+app.post('/api/hr/import', hrUpload.single('file'), async (req, res) => {
+  if (!requireRoles(req, res, HR_ROLES)) return;
+  if (!req.file) {
+    res.status(400).json({ error: 'Falta el archivo.' });
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = parseDotacionWorkbook(req.file.buffer);
+  } catch (error) {
+    res.status(400).json({ error: `No se pudo leer el archivo: ${error.message}` });
+    return;
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.hrContract.deleteMany({});
+    if (parsed.contracts.length > 0) {
+      await tx.hrContract.createMany({ data: parsed.contracts });
+    }
+  }, { timeout: 60000, maxWait: 20000 });
+
+  res.status(201).json({
+    hoja: parsed.sheetName,
+    filasImportadas: parsed.contracts.length,
+    importadoEn: new Date().toISOString(),
+  });
+});
+
+// Búsqueda liviana de personas en la dotación (RRHH), para vincular un profesional de la agenda
+// a su ficha de RUT/cargo/unidad en vez de escribir el nombre a mano. A diferencia de
+// /api/hr/summary, esto lo puede usar cualquier usuario autenticado (no solo HR_ROLES) porque
+// un jefe de servicio necesita poder buscar dotación al armar su propia agenda.
+app.get('/api/hr/personas', async (req, res) => {
+  if (!requireAuth(req, res)) return;
+
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  if (q.length < 2) {
+    res.json({ items: [] });
+    return;
+  }
+  const planta = typeof req.query.planta === 'string' && req.query.planta.trim()
+    ? req.query.planta.trim().toUpperCase()
+    : 'MEDICOS';
+  const qNorm = normalizeText(q);
+
+  const contracts = await prisma.hrContract.findMany({ where: { planta } });
+  const now = new Date();
+  const porRut = new Map();
+  for (const c of contracts) {
+    if (!normalizeText(c.nombreFuncionario).includes(qNorm)) continue;
+    if (!porRut.has(c.rut)) {
+      porRut.set(c.rut, {
+        rut: c.rut, dv: c.dv, nombreFuncionario: c.nombreFuncionario,
+        cargos: new Set(), unidades: new Set(), horasContratadas: 0,
+      });
+    }
+    const p = porRut.get(c.rut);
+    if (c.cargo) p.cargos.add(c.cargo);
+    if (c.unidadDescripcion) p.unidades.add(c.unidadDescripcion);
+    const vigente = (!c.fechaInicioContrato || c.fechaInicioContrato <= now) && (!c.fechaTerminoContrato || c.fechaTerminoContrato >= now);
+    if (c.ley === 'LEY 19.664' && vigente) p.horasContratadas += c.numeroHoras || 0;
+  }
+
+  const items = [...porRut.values()]
+    .map((p) => ({
+      rut: p.rut,
+      dv: p.dv,
+      nombreFuncionario: p.nombreFuncionario,
+      cargo: [...p.cargos].join(' / '),
+      unidad: [...p.unidades].join(' / '),
+      horasContratadas: Math.round(p.horasContratadas * 10) / 10,
+    }))
+    .sort((a, b) => a.nombreFuncionario.localeCompare(b.nombreFuncionario))
+    .slice(0, 20);
+
+  res.json({ items });
+});
+
+app.get('/api/hr/summary', async (req, res) => {
+  if (!requireRoles(req, res, HR_ROLES)) return;
+
+  const planta = typeof req.query.planta === 'string' && req.query.planta.trim()
+    ? req.query.planta.trim().toUpperCase()
+    : 'MEDICOS';
+
+  const [contracts, lastImport] = await Promise.all([
+    prisma.hrContract.findMany({ where: { planta } }),
+    prisma.hrContract.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
+  ]);
+
+  const now = new Date();
+  const porRut = new Map(); // rut -> { nombre, cargo, unidad, horasContratadas, tieneTurno, dv }
+  for (const c of contracts) {
+    if (!porRut.has(c.rut)) {
+      porRut.set(c.rut, {
+        rut: c.rut, dv: c.dv, nombre: c.nombreFuncionario, cargo: c.cargo,
+        unidad: c.unidadDescripcion, horasContratadas: 0, tieneTurno: false,
+      });
+    }
+    const acc = porRut.get(c.rut);
+    if (c.ley === 'LEY 15.076') acc.tieneTurno = true;
+    if (c.ley !== 'LEY 19.664') continue;
+    const vigente = (!c.fechaInicioContrato || c.fechaInicioContrato <= now) && (!c.fechaTerminoContrato || c.fechaTerminoContrato >= now);
+    if (!vigente) continue;
+    acc.horasContratadas += c.numeroHoras || 0;
+  }
+
+  // Todos los profesionales ya cargados (de cualquier servicio) con sus horas de jornada
+  // programadas (excluye turno) y en qué agenda(s) aparecen — se cruza en memoria porque el
+  // universo de profesionales es chico (unos cientos), no miles.
+  const professionals = await prisma.agendaProfessional.findMany({
+    select: {
+      id: true, name: true, rut: true,
+      agenda: { select: { serviceName: true } },
+      blocks: { where: { isShift: false }, select: { durationMinutes: true } },
+    },
+  });
+
+  const porNombreProfesional = new Map();
+  for (const p of professionals) {
+    const key = normalizeText(p.name);
+    if (!porNombreProfesional.has(key)) porNombreProfesional.set(key, []);
+    porNombreProfesional.get(key).push(p);
+  }
+
+  const resultado = [];
+  for (const acc of porRut.values()) {
+    let matches = professionals.filter((p) => p.rut && p.rut === acc.rut);
+    let coincidenciaPorNombre = false;
+    if (matches.length === 0) {
+      matches = porNombreProfesional.get(normalizeText(acc.nombre)) || [];
+      coincidenciaPorNombre = matches.length > 0;
+    }
+    const horasProgramadas = matches.reduce(
+      (sum, p) => sum + p.blocks.reduce((s, b) => s + b.durationMinutes, 0) / 60,
+      0
+    );
+    const servicios = [...new Set(matches.map((p) => p.agenda.serviceName))];
+    resultado.push({
+      rut: acc.rut,
+      dv: acc.dv,
+      nombre: acc.nombre,
+      cargo: acc.cargo,
+      unidad: acc.unidad,
+      tieneTurno: acc.tieneTurno,
+      horasContratadas: Math.round(acc.horasContratadas * 10) / 10,
+      horasProgramadas: Math.round(horasProgramadas * 10) / 10,
+      horasPendientes: Math.round((acc.horasContratadas - horasProgramadas) * 10) / 10,
+      servicios,
+      coincidenciaPorNombre,
+      sinAgendar: matches.length === 0,
+    });
+  }
+
+  resultado.sort((a, b) => b.horasPendientes - a.horasPendientes);
+
+  res.json({
+    planta,
+    ultimaImportacion: lastImport?.createdAt ?? null,
+    total: resultado.length,
+    items: resultado,
+  });
+});
+
+app.post('/api/pabellon/import', hrUpload.single('file'), async (req, res) => {
+  if (!requireRoles(req, res, HR_ROLES)) return;
+  if (!req.file) {
+    res.status(400).json({ error: 'Falta el archivo.' });
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = parsePabellonWorkbook(req.file.buffer);
+  } catch (error) {
+    res.status(400).json({ error: `No se pudo leer el archivo: ${error.message}` });
+    return;
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.pabellonAllocation.deleteMany({});
+    if (parsed.allocations.length > 0) {
+      await tx.pabellonAllocation.createMany({ data: parsed.allocations });
+    }
+  }, { timeout: 60000, maxWait: 20000 });
+
+  res.status(201).json({
+    hoja: parsed.sheetName,
+    filasImportadas: parsed.allocations.length,
+    importadoEn: new Date().toISOString(),
+  });
+});
+
+app.get('/api/pabellon/summary', async (req, res) => {
+  if (!requireRoles(req, res, HR_ROLES)) return;
+
+  const [allocations, services, lastImport] = await Promise.all([
+    prisma.pabellonAllocation.findMany(),
+    prisma.service.findMany({ select: { id: true, name: true } }),
+    prisma.pabellonAllocation.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
+  ]);
+
+  const serviceIdByName = new Map(services.map((s) => [s.name, s.id]));
+
+  // Sesiones asignadas: una celda de la grilla puede resolver a más de un servicio (uso
+  // compartido, ej. "Cir. A. /Oftalmologia") — cada uno de esos servicios suma una sesión
+  // asignada, no se reparte. Se guarda también el detalle (qué pabellón/jornada/día) para poder
+  // mostrarlo en la app, no solo el total.
+  const asignadasPorServicio = new Map();
+  for (const a of allocations) {
+    for (const servicio of resolveServiciosDesdeTexto(a.especialidadTexto)) {
+      if (!asignadasPorServicio.has(servicio)) asignadasPorServicio.set(servicio, []);
+      asignadasPorServicio.get(servicio).push({ grupo: a.grupo, pabellon: a.pabellon, jornada: a.jornada, dia: a.dia });
+    }
+  }
+
+  // Comparación en HORAS, no en "pabellones simultáneos": un mismo pabellón puede operar
+  // legítimamente con 2-3 cirujanos a la vez (pabellón compartido), así que contar "profesionales
+  // en paralelo" como si cada uno ocupara un pabellón distinto sobreestima la necesidad de
+  // infraestructura. En horas esa concurrencia ya no es un problema — las horas de cada
+  // profesional simplemente se suman — y el número de profesionales en paralelo se muestra aparte
+  // en la grilla para que quede a la vista (no escondido) y el usuario juzgue si es normal.
+
+  // Suma un bloque de agenda a un par de grillas (horas + paralelos) de un grupo específico.
+  function agregarBloqueAGrupo(gridProgramado, gridParalelos, paralelosSets, b) {
+    const fin = b.startMinutes + b.durationMinutes;
+    agregarAGrid(gridProgramado, b.day, b.startMinutes, fin, (overlapMin) => overlapMin / 60);
+    BLOQUES_GRID.forEach((label, i) => {
+      const cellStart = HORA_INICIO_GRID * 60 + i * 30;
+      const cellEnd = cellStart + 30;
+      if (Math.min(fin, cellEnd) - Math.max(b.startMinutes, cellStart) > 0) {
+        paralelosSets[b.day][label] += 1;
+      }
+    });
+  }
+
+  const resultado = [];
+  for (const [servicio, detalleAsignadas] of asignadasPorServicio) {
+    const serviceId = serviceIdByName.get(servicio);
+
+    // Segmenta por "grupo" (ej. Pabellón Cirugía Mayor vs. Pabellón Cirugía Mayor Ambulatoria /
+    // UCA) para poder comparar cada uno por separado — son físicamente distintos, no tiene
+    // sentido sumarlos como si fueran el mismo pabellón.
+    const nombresGrupo = [...new Set(detalleAsignadas.map((a) => a.grupo))];
+
+    const blocks = serviceId
+      ? await prisma.agendaBlock.findMany({
+          where: {
+            isShift: false,
+            activity: { contains: 'Pabellon', mode: 'insensitive' },
+            agenda: { serviceId },
+          },
+          select: { day: true, startMinutes: true, durationMinutes: true, activity: true },
+        }).then((rows) => rows.filter((b) => DIAS_SEMANA.includes(b.day)))
+      : [];
+
+    const gruposResultado = [];
+    let horasAsignadas = 0;
+    let horasProgramadas = 0;
+
+    for (const grupo of nombresGrupo) {
+      const asignadasGrupo = detalleAsignadas.filter((a) => a.grupo === grupo);
+      const gridAsignado = gridVacia();
+      let horasAsignadasGrupo = 0;
+      for (const a of asignadasGrupo) {
+        const ventana = VENTANA_JORNADA[a.jornada];
+        if (!ventana) continue;
+        const [inicio, fin] = ventana;
+        horasAsignadasGrupo += (fin - inicio) / 60;
+        // Cantidad de pabellones asignados por celda de 30 min (conteo entero, igual a como se
+        // cuenta a mano en la planilla) — no una conversión a horas, que confundía la lectura.
+        agregarAGrid(gridAsignado, a.dia, inicio, fin, 1);
+      }
+
+      // El texto de actividad de la agenda ("Pabellon Cirugía Mayor", "Pabellon Cirugía Mayor
+      // Ambulatoria") coincide con el nombre del grupo de la planilla salvo tildes/mayúsculas —
+      // se usa ese cruce para saber qué horas programadas corresponden a CADA pabellón físico,
+      // en vez de sumarlas todas juntas bajo un solo "Pabellon" genérico.
+      const blocksGrupo = blocks.filter((b) => normalizeText(b.activity) === normalizeText(grupo));
+      const gridProgramado = gridVacia();
+      const gridParalelos = gridVacia();
+      const paralelosSets = {};
+      DIAS_SEMANA.forEach((dia) => { paralelosSets[dia] = {}; BLOQUES_GRID.forEach((b) => { paralelosSets[dia][b] = 0; }); });
+      let horasProgramadasGrupo = 0;
+      for (const b of blocksGrupo) {
+        horasProgramadasGrupo += b.durationMinutes / 60;
+        agregarBloqueAGrupo(gridProgramado, gridParalelos, paralelosSets, b);
+      }
+      DIAS_SEMANA.forEach((dia) => { BLOQUES_GRID.forEach((bq) => { gridParalelos[dia][bq] = paralelosSets[dia][bq]; }); });
+
+      horasAsignadas += horasAsignadasGrupo;
+      horasProgramadas += horasProgramadasGrupo;
+      gruposResultado.push({
+        grupo,
+        horasAsignadas: Math.round(horasAsignadasGrupo * 10) / 10,
+        horasProgramadas: Math.round(horasProgramadasGrupo * 10) / 10,
+        diferenciaHoras: Math.round((horasProgramadasGrupo - horasAsignadasGrupo) * 10) / 10,
+        gridAsignado,
+        gridProgramado,
+        gridParalelos,
+      });
+    }
+
+    // Horas programadas bajo actividad "Pabellon..." que no calzan con NINGÚN grupo conocido de
+    // la planilla (nombre de actividad distinto al de la planilla) — se informan aparte para que
+    // no desaparezcan silenciosamente de la comparación.
+    const horasSinGrupo = blocks
+      .filter((b) => !nombresGrupo.some((g) => normalizeText(b.activity) === normalizeText(g)))
+      .reduce((s, b) => s + b.durationMinutes / 60, 0);
+
+    resultado.push({
+      servicio,
+      cargado: !!serviceId,
+      horasAsignadas: Math.round(horasAsignadas * 10) / 10,
+      horasProgramadas: Math.round(horasProgramadas * 10) / 10,
+      diferenciaHoras: Math.round((horasProgramadas - horasAsignadas) * 10) / 10,
+      horasProgramadasSinGrupo: Math.round(horasSinGrupo * 10) / 10,
+      grupos: gruposResultado,
+    });
+  }
+
+  resultado.sort((a, b) => Math.abs(b.diferenciaHoras) - Math.abs(a.diferenciaHoras));
+
+  // Grilla para mostrar la planificación tal cual viene de la planilla (agrupada por
+  // "grupo" — ej. Cirugía Mayor Ambulatoria / Cirugía Mayor — con pabellón+jornada como fila y
+  // día como columna, igual a como se ve en el Excel original).
+  const DIAS_ORDEN = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
+  const gruposMap = new Map();
+  for (const a of allocations) {
+    if (!gruposMap.has(a.grupo)) gruposMap.set(a.grupo, { pabellones: new Set(), dias: new Set(), celdas: {} });
+    const g = gruposMap.get(a.grupo);
+    g.pabellones.add(a.pabellon);
+    g.dias.add(a.dia);
+    const key = `${a.pabellon}|||${a.jornada}`;
+    if (!g.celdas[key]) g.celdas[key] = {};
+    g.celdas[key][a.dia] = a.especialidadTexto;
+  }
+  const grid = [...gruposMap.entries()].map(([grupo, g]) => ({
+    grupo,
+    pabellones: [...g.pabellones].sort((a, b) => Number(a) - Number(b) || a.localeCompare(b)),
+    dias: DIAS_ORDEN.filter((d) => g.dias.has(d)),
+    celdas: g.celdas,
+  }));
+
+  res.json({
+    ultimaImportacion: lastImport?.createdAt ?? null,
+    total: resultado.length,
+    items: resultado,
+    grid,
+    dias: DIAS_SEMANA,
+    bloques: BLOQUES_GRID,
+  });
+});
+
+// Versión liviana de la grilla "asignado" de pabellón para UN servicio, pensada para incrustarse
+// en el heatmap de "Distribución horaria" del resumen de esa agenda (no el módulo completo de
+// Infraestructura, que compara todos los servicios y requiere rol de RRHH). Un jefe_servicio
+// puede consultar la capacidad de pabellón de su propio servicio; los roles de RRHH pueden
+// consultar cualquiera.
+app.get('/api/pabellon/capacidad', async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const servicio = typeof req.query.servicio === 'string' ? req.query.servicio.trim() : '';
+  if (!servicio) {
+    res.status(400).json({ error: 'Falta el parámetro servicio.' });
+    return;
+  }
+  const esRolRrhh = HR_ROLES.includes(req.authUser.role);
+  const tieneAcceso = esRolRrhh || (req.authUser.role === 'jefe_servicio' && req.authUser.serviceNames?.includes(servicio));
+  if (!tieneAcceso) {
+    res.status(403).json({ error: 'No autorizado para consultar la capacidad de este servicio.' });
+    return;
+  }
+
+  const [allocations, lastImport] = await Promise.all([
+    prisma.pabellonAllocation.findMany(),
+    prisma.pabellonAllocation.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
+  ]);
+
+  const grid = gridVacia();
+  let cargado = false;
+  for (const a of allocations) {
+    if (!resolveServiciosDesdeTexto(a.especialidadTexto).includes(servicio)) continue;
+    const ventana = VENTANA_JORNADA[a.jornada];
+    if (!ventana) continue;
+    cargado = true;
+    agregarAGrid(grid, a.dia, ventana[0], ventana[1], 1);
+  }
+
+  res.json({
+    servicio,
+    cargado,
+    ultimaImportacion: lastImport?.createdAt ?? null,
+    dias: DIAS_SEMANA,
+    bloques: BLOQUES_GRID,
+    grid,
+  });
+});
+
 app.get('/api/agendas', async (req, res) => {
   if (!requireAuth(req, res)) return;
 
@@ -780,6 +1259,10 @@ app.post('/api/agendas', async (req, res) => {
     return;
   }
 
+  // writeAgendaGraph crea profesionales y bloques uno por uno (no en lote), así que clonar una
+  // agenda con cientos de bloques ("comenzar desde la última versión") puede tardar más que el
+  // timeout por defecto de una transacción interactiva de Prisma (5s) — con la latencia de Neon
+  // eso basta para que la transacción expire (P2028) y la creación parezca "no hacer nada".
   const created = await prisma.$transaction(async (tx) => {
     const record = await writeAgendaGraph(
       tx,
@@ -789,18 +1272,11 @@ app.post('/api/agendas', async (req, res) => {
         jefe: req.authUser.role === 'jefe_servicio' ? req.authUser.name : payload.jefe,
         vigenciaDesde: payload.vigenciaDesde,
         vigenciaHasta: payload.vigenciaHasta,
+        chiefUserId: req.authUser.role === 'jefe_servicio' ? req.authUser.id : null,
       },
       null
     );
 
-    await tx.agenda.update({
-      where: { id: record.id },
-      data: {
-        serviceId: service.id,
-        chiefUserId: req.authUser.role === 'jefe_servicio' ? req.authUser.id : null,
-        chiefName: req.authUser.role === 'jefe_servicio' ? req.authUser.name : payload.jefe,
-      },
-    });
     await createAudit(tx, record.id, req.authUser, 'create', 'agenda', record.externalId, payload);
     if (!payload.pendienteConfirmar) {
       await createHistory(tx, record.id, req.authUser, 'Creada', {
@@ -809,7 +1285,7 @@ app.post('/api/agendas', async (req, res) => {
       });
     }
     return record;
-  });
+  }, { timeout: 60000, maxWait: 20000 });
 
   const hydrated = await findAgendaRecord(prisma, created.externalId);
   res.status(201).json(serializeAgenda(hydrated));
@@ -846,9 +1322,40 @@ app.put('/api/agendas/:externalId', async (req, res) => {
     );
     await createAudit(tx, existing.id, req.authUser, 'update', 'agenda', existing.externalId, payload);
     return updated;
-  });
+  }, { timeout: 60000, maxWait: 20000 });
 
   const hydrated = await findAgendaRecord(prisma, record.externalId);
+  res.json(serializeAgenda(hydrated));
+});
+
+// Edición liviana de campos sueltos del encabezado de la agenda (%CNE, atenciones, distribución
+// horaria manual) — a diferencia del PUT completo de arriba, esto NO toca profesionales/bloques
+// (writeAgendaGraph los borra y recrea enteros, innecesario y lento para cambiar un solo número).
+// Existe porque estos 3 campos se editaban SOLO en el estado local de React sin ningún llamado a
+// la API — se veían guardados en la pantalla pero se perdían apenas se recargaba la página.
+app.patch('/api/agendas/:externalId/fields', async (req, res) => {
+  if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
+
+  const existing = await loadAgendaOr404(req.params.externalId, res);
+  if (!existing) return;
+  if (!canEditAgenda(req.authUser, existing)) {
+    res.status(403).json({ error: 'No autorizado para editar esta agenda.' });
+    return;
+  }
+
+  const data = {};
+  if (req.body?.cnePct !== undefined) data.cnePct = Number(req.body.cnePct) || 0;
+  if (req.body?.atenciones !== undefined) data.appointments = Number(req.body.atenciones) || 0;
+  if (req.body?.distribucionHoraria !== undefined) data.distributionJson = JSON.stringify(req.body.distribucionHoraria ?? {});
+  if (Object.keys(data).length === 0) {
+    res.status(400).json({ error: 'Nada que actualizar.' });
+    return;
+  }
+  data.lastUpdated = BigInt(Date.now());
+
+  await prisma.agenda.update({ where: { id: existing.id }, data });
+
+  const hydrated = await findAgendaRecord(prisma, existing.externalId);
   res.json(serializeAgenda(hydrated));
 });
 
@@ -1050,7 +1557,7 @@ app.post('/api/agendas/sync', async (req, res) => {
       await writeAgendaGraph(tx, agenda, existingMap.get(String(agenda.id)) ?? null);
       existingMap.delete(String(agenda.id));
     }
-  });
+  }, { timeout: 120000, maxWait: 20000 });
 
   const stored = await prisma.agenda.findMany({
     where: buildAgendaWhereForUser(req.authUser, {}),
@@ -1128,6 +1635,7 @@ app.post('/api/agendas/:externalId/professionals', async (req, res) => {
         trainingLevel: typeof req.body?.nivelFormacion === 'string' ? req.body.nivelFormacion.trim() || null : null,
         hasTurno: Boolean(req.body?.tieneTurno ?? false),
         isShiftOnly: Boolean(req.body?.esSoloTurno ?? false),
+        rut: normalizeRut(req.body?.rut) || null,
         sortOrder: currentCount,
       },
     });
@@ -1143,6 +1651,7 @@ app.post('/api/agendas/:externalId/professionals', async (req, res) => {
     nivelFormacion: created.trainingLevel,
     tieneTurno: created.hasTurno,
     esSoloTurno: created.isShiftOnly,
+    rut: created.rut,
   });
 });
 
@@ -1167,6 +1676,7 @@ app.put('/api/agendas/:externalId/professionals/:professionalId', async (req, re
         trainingLevel: req.body?.nivelFormacion !== undefined ? (typeof req.body.nivelFormacion === 'string' ? req.body.nivelFormacion.trim() || null : null) : professional.trainingLevel,
         hasTurno: req.body?.tieneTurno !== undefined ? Boolean(req.body.tieneTurno) : professional.hasTurno,
         isShiftOnly: req.body?.esSoloTurno !== undefined ? Boolean(req.body.esSoloTurno) : professional.isShiftOnly,
+        rut: req.body?.rut !== undefined ? (normalizeRut(req.body.rut) || null) : professional.rut,
       },
     });
     await createAudit(tx, agenda.id, req.authUser, 'update', 'professional', professional.externalId || professional.id, req.body);
@@ -1181,6 +1691,7 @@ app.put('/api/agendas/:externalId/professionals/:professionalId', async (req, re
     nivelFormacion: updated.trainingLevel,
     tieneTurno: updated.hasTurno,
     esSoloTurno: updated.isShiftOnly,
+    rut: updated.rut,
   });
 });
 
@@ -1621,17 +2132,18 @@ app.get('/api/services/:serviceId/shift-roster', async (req, res) => {
   const days = [];
   for (let t = dateOnlyUTC(from); t <= dateOnlyUTC(to); t += 24 * 60 * 60 * 1000) {
     const date = new Date(t);
-    const entries = rotations.map((rotation) => {
+    const entries = rotations.flatMap((rotation) => {
       const resolved = resolveShiftForDate(rotation, date);
-      return {
+      return resolved.map((r) => ({
         unidad: rotation.unidad,
         puesto: rotation.puesto,
-        startMinutes: rotation.startMinutes,
-        durationMinutes: rotation.durationMinutes,
-        professionalId: resolved?.professionalId ?? null,
-        professionalName: resolved?.professionalName ?? null,
-        esSustitucion: resolved?.isOverride ?? false,
-      };
+        startMinutes: r.startMinutes,
+        durationMinutes: r.durationMinutes,
+        professionalId: r.professionalId,
+        professionalName: r.professionalName,
+        esSustitucion: r.isOverride,
+        tramoSplit: r.tramoSplit ?? null,
+      }));
     });
     days.push({ date: date.toISOString().slice(0, 10), entries });
   }
@@ -1642,8 +2154,10 @@ app.get('/api/services/:serviceId/shift-roster', async (req, res) => {
     const date = new Date(t);
     for (const rotation of rotations) {
       const resolved = resolveShiftForDate(rotation, date);
-      if (!resolved?.professionalName) continue;
-      countsMap.set(resolved.professionalName, (countsMap.get(resolved.professionalName) || 0) + 1);
+      for (const r of resolved) {
+        if (!r.professionalName) continue;
+        countsMap.set(r.professionalName, (countsMap.get(r.professionalName) || 0) + 1);
+      }
     }
   }
 
@@ -1666,6 +2180,10 @@ app.get('/api/services/:serviceId/shift-roster', async (req, res) => {
       if (o.professionalId) {
         professionalIds.add(o.professionalId);
         nombrePorId.set(o.professionalId, o.professionalName);
+      }
+      if (o.splitProfessionalId) {
+        professionalIds.add(o.splitProfessionalId);
+        nombrePorId.set(o.splitProfessionalId, o.splitProfessionalName);
       }
     }
   }
@@ -1725,46 +2243,50 @@ app.get('/api/services/:serviceId/shift-roster', async (req, res) => {
       const date = new Date(dayIndex * 86400000);
       for (const rotation of rotations) {
         if (!rotation.affectsJornada) continue;
-        const resolved = resolveShiftForDate(rotation, date);
-        if (!resolved?.professionalId) continue;
-        const profId = resolved.professionalId;
-        const turnoAbsStart = dayIndex * 1440 + rotation.startMinutes;
-        const turnoAbsEnd = turnoAbsStart + rotation.durationMinutes;
+        const resueltos = resolveShiftForDate(rotation, date);
+        for (const resolved of resueltos) {
+          if (!resolved?.professionalId) continue;
+          const profId = resolved.professionalId;
+          // Cada sub-turno (día/noche si hubo split) trae su propio horario — ya no se asume
+          // que todos duran lo mismo que la rotación base (24h).
+          const turnoAbsStart = dayIndex * 1440 + resolved.startMinutes;
+          const turnoAbsEnd = turnoAbsStart + resolved.durationMinutes;
 
-        // El turno puede superponerse con la jornada del mismo día (dayIndex) o del día
-        // siguiente (dayIndex+1) si cruza medianoche.
-        for (const diaAfectado of [dayIndex, dayIndex + 1]) {
-          if (diaAfectado < dayIndexFrom || diaAfectado > dayIndexTo) continue;
-          const weekday = WEEKDAY_BY_JS_DAY[new Date(diaAfectado * 86400000).getUTCDay()];
-          if (!weekday) continue;
-          const bloquesDia = jornadaPorDiaPorProf.get(profId)?.get(weekday) || [];
-          let perdidasEseDia = 0;
-          for (const b of bloquesDia) {
-            const blockAbsStart = diaAfectado * 1440 + b.startMinutes;
-            const blockAbsEnd = blockAbsStart + b.durationMinutes;
-            const overlap = Math.min(turnoAbsEnd, blockAbsEnd) - Math.max(turnoAbsStart, blockAbsStart);
-            if (overlap > 0) {
-              perdidasEseDia += overlap;
-              // La clave NO incluye la duración del bloque: el frontend recalcula bloques
-              // "efectivos" con duración reducida y necesita poder volver a encontrar la misma
-              // entrada usando esa duración ya ajustada, así que el bloque se identifica solo
-              // por profesional + día + hora de inicio (suficiente en la práctica: un mismo
-              // profesional no tiene dos bloques distintos que empiecen exactamente a la misma
-              // hora el mismo día de la semana).
-              const bloqueKey = `${profId}|||${weekday}|||${b.startMinutes}`;
-              perdidaPorBloqueAcc.set(bloqueKey, (perdidaPorBloqueAcc.get(bloqueKey) || 0) + overlap);
-              if (!perdidaPorBloqueMeta.has(bloqueKey)) perdidaPorBloqueMeta.set(bloqueKey, b.durationMinutes);
+          // El turno puede superponerse con la jornada del mismo día (dayIndex) o del día
+          // siguiente (dayIndex+1) si cruza medianoche.
+          for (const diaAfectado of [dayIndex, dayIndex + 1]) {
+            if (diaAfectado < dayIndexFrom || diaAfectado > dayIndexTo) continue;
+            const weekday = WEEKDAY_BY_JS_DAY[new Date(diaAfectado * 86400000).getUTCDay()];
+            if (!weekday) continue;
+            const bloquesDia = jornadaPorDiaPorProf.get(profId)?.get(weekday) || [];
+            let perdidasEseDia = 0;
+            for (const b of bloquesDia) {
+              const blockAbsStart = diaAfectado * 1440 + b.startMinutes;
+              const blockAbsEnd = blockAbsStart + b.durationMinutes;
+              const overlap = Math.min(turnoAbsEnd, blockAbsEnd) - Math.max(turnoAbsStart, blockAbsStart);
+              if (overlap > 0) {
+                perdidasEseDia += overlap;
+                // La clave NO incluye la duración del bloque: el frontend recalcula bloques
+                // "efectivos" con duración reducida y necesita poder volver a encontrar la misma
+                // entrada usando esa duración ya ajustada, así que el bloque se identifica solo
+                // por profesional + día + hora de inicio (suficiente en la práctica: un mismo
+                // profesional no tiene dos bloques distintos que empiecen exactamente a la misma
+                // hora el mismo día de la semana).
+                const bloqueKey = `${profId}|||${weekday}|||${b.startMinutes}`;
+                perdidaPorBloqueAcc.set(bloqueKey, (perdidaPorBloqueAcc.get(bloqueKey) || 0) + overlap);
+                if (!perdidaPorBloqueMeta.has(bloqueKey)) perdidaPorBloqueMeta.set(bloqueKey, b.durationMinutes);
+              }
             }
-          }
-          if (perdidasEseDia > 0) {
-            if (!acumulador.has(profId)) acumulador.set(profId, { nominal: 0, perdidas: 0, detalle: [] });
-            const acc = acumulador.get(profId);
-            acc.perdidas += perdidasEseDia;
-            acc.detalle.push({
-              date: new Date(diaAfectado * 86400000).toISOString().slice(0, 10),
-              weekday,
-              horas: Math.round((perdidasEseDia / 60) * 10) / 10,
-            });
+            if (perdidasEseDia > 0) {
+              if (!acumulador.has(profId)) acumulador.set(profId, { nominal: 0, perdidas: 0, detalle: [] });
+              const acc = acumulador.get(profId);
+              acc.perdidas += perdidasEseDia;
+              acc.detalle.push({
+                date: new Date(diaAfectado * 86400000).toISOString().slice(0, 10),
+                weekday,
+                horas: Math.round((perdidasEseDia / 60) * 10) / 10,
+              });
+            }
           }
         }
       }
@@ -1976,6 +2498,15 @@ app.post('/api/services/:serviceId/shift-rotations/:rotationId/overrides', async
   }
 
   const resolvedProfessionalId = await resolveInternalProfessionalId(prisma, req.body?.professionalId);
+
+  // Cobertura dividida (feriado legal cubierto por 2 personas, día/noche): splitProfessionalName
+  // es opcional — si viene, el override representa dos sub-turnos de 12h en vez de reemplazar el
+  // turno completo de la rotación por una sola persona.
+  const splitProfessionalName = typeof req.body?.splitProfessionalName === 'string' ? req.body.splitProfessionalName.trim() : '';
+  const resolvedSplitProfessionalId = splitProfessionalName
+    ? await resolveInternalProfessionalId(prisma, req.body?.splitProfessionalId)
+    : null;
+
   const override = await prisma.shiftRotationOverride.upsert({
     where: { rotationId_date: { rotationId, date } },
     create: {
@@ -1984,11 +2515,15 @@ app.post('/api/services/:serviceId/shift-rotations/:rotationId/overrides', async
       professionalId: resolvedProfessionalId,
       professionalName,
       note: typeof req.body?.note === 'string' ? req.body.note.trim() || null : null,
+      splitProfessionalId: resolvedSplitProfessionalId,
+      splitProfessionalName: splitProfessionalName || null,
     },
     update: {
       professionalId: resolvedProfessionalId,
       professionalName,
       note: typeof req.body?.note === 'string' ? req.body.note.trim() || null : null,
+      splitProfessionalId: resolvedSplitProfessionalId,
+      splitProfessionalName: splitProfessionalName || null,
     },
   });
   res.status(201).json({ id: override.id });

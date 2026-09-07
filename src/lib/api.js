@@ -113,6 +113,13 @@ export async function updateAgenda(externalId, payload) {
   });
 }
 
+export async function updateAgendaFields(externalId, payload) {
+  return request(`/agendas/${externalId}/fields`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function deleteAgenda(externalId) {
   return request(`/agendas/${externalId}`, {
     method: 'DELETE',
@@ -241,4 +248,54 @@ export async function deleteShiftOverride(serviceId, rotationId, overrideId) {
   return request(`/services/${serviceId}/shift-rotations/${rotationId}/overrides/${overrideId}`, {
     method: 'DELETE',
   });
+}
+
+export async function uploadHrDotacion(file) {
+  const token = getAuthToken();
+  const form = new FormData();
+  form.append('file', file);
+  // No se fija Content-Type a mano: el navegador arma el boundary de multipart solo si se lo
+  // dejamos, por eso esto no pasa por request() (que siempre fuerza application/json).
+  const response = await fetch(`${API_BASE}/hr/import`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `Request failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function fetchHrSummary(params) {
+  return request(`/hr/summary${buildQuery(params)}`);
+}
+
+export async function fetchHrPersonas(q, planta) {
+  return request(`/hr/personas${buildQuery({ q, planta })}`);
+}
+
+export async function uploadPabellonPlan(file) {
+  const token = getAuthToken();
+  const form = new FormData();
+  form.append('file', file);
+  const response = await fetch(`${API_BASE}/pabellon/import`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `Request failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function fetchPabellonSummary() {
+  return request('/pabellon/summary');
+}
+
+export async function fetchPabellonCapacidad(servicio) {
+  return request(`/pabellon/capacidad${buildQuery({ servicio })}`);
 }

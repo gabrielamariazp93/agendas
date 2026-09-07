@@ -1,3 +1,5 @@
+import { randomUUID } from 'crypto';
+
 export function toAgendaStatus(value) {
   const allowed = ['borrador', 'enviada', 'aprobada', 'rechazada', 'escalada', 'subida_alma'];
   return allowed.includes(value) ? value : 'borrador';
@@ -40,6 +42,7 @@ export function serializeAgenda(record) {
       nivelFormacion: professional.trainingLevel,
       esSoloTurno: professional.isShiftOnly,
       tieneTurno: professional.hasTurno,
+      rut: professional.rut,
     }));
 
   const professionalIdMap = new Map(
@@ -132,6 +135,7 @@ export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
           hoursJson: JSON.stringify(agenda.horas ?? {}),
           distributionJson: JSON.stringify(agenda.distribucionHoraria ?? {}),
           sourceSnapshot: JSON.stringify(agenda),
+          ...(agenda.chiefUserId !== undefined ? { chiefUserId: agenda.chiefUserId } : {}),
         },
       })
     : await prismaOrTx.agenda.create({
@@ -155,18 +159,31 @@ export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
           hoursJson: JSON.stringify(agenda.horas ?? {}),
           distributionJson: JSON.stringify(agenda.distribucionHoraria ?? {}),
           sourceSnapshot: JSON.stringify(agenda),
+          ...(agenda.chiefUserId !== undefined ? { chiefUserId: agenda.chiefUserId } : {}),
         },
       });
 
-  await prismaOrTx.agendaHistory.deleteMany({ where: { agendaId: agendaRecord.id } });
-  await prismaOrTx.agendaBlock.deleteMany({ where: { agendaId: agendaRecord.id } });
-  await prismaOrTx.agendaProfessional.deleteMany({ where: { agendaId: agendaRecord.id } });
+  // En una agenda recién creada no hay nada que borrar todavía — saltarse estos 3 round-trips
+  // cuando existingId es null evita 3 idas y vueltas a Neon que no hacen nada.
+  if (existingId) {
+    await prismaOrTx.agendaHistory.deleteMany({ where: { agendaId: agendaRecord.id } });
+    await prismaOrTx.agendaBlock.deleteMany({ where: { agendaId: agendaRecord.id } });
+    await prismaOrTx.agendaProfessional.deleteMany({ where: { agendaId: agendaRecord.id } });
+  }
 
+  // createMany en vez de un .create() por fila: una agenda clonada desde una versión anterior
+  // puede traer cientos de bloques, y cientos de round-trips secuenciales a Neon dentro de una
+  // misma transacción alcanzan a expirar el timeout de la transacción interactiva de Prisma
+  // (P2028) antes de terminar. Los ids internos se generan acá mismo (randomUUID) porque
+  // createMany no devuelve las filas creadas, y los bloques necesitan el id real del profesional
+  // para enlazarse.
   const professionalMap = new Map();
-  for (let index = 0; index < agenda.profesionales.length; index += 1) {
-    const professional = agenda.profesionales[index];
-    const created = await prismaOrTx.agendaProfessional.create({
-      data: {
+  if (agenda.profesionales.length > 0) {
+    const professionalsData = agenda.profesionales.map((professional, index) => {
+      const id = randomUUID();
+      professionalMap.set(String(professional.id), id);
+      return {
+        id,
         agendaId: agendaRecord.id,
         externalId: String(professional.id),
         name: professional.nombre,
@@ -175,50 +192,48 @@ export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
         trainingLevel: professional.nivelFormacion ?? null,
         hasTurno: Boolean(professional.tieneTurno ?? false),
         isShiftOnly: Boolean(professional.esSoloTurno ?? false),
+        rut: professional.rut ?? null,
         sortOrder: index,
-      },
+      };
     });
-    professionalMap.set(String(professional.id), created.id);
+    await prismaOrTx.agendaProfessional.createMany({ data: professionalsData });
   }
 
-  for (let index = 0; index < agenda.bloquesProf.length; index += 1) {
-    const block = agenda.bloquesProf[index];
-    const professionalId = professionalMap.get(String(block.profesionalId));
-    if (!professionalId) continue;
-
-    await prismaOrTx.agendaBlock.create({
-      data: {
-        agendaId: agendaRecord.id,
-        professionalId,
-        externalId: String(block.id),
-        day: block.dia,
-        startMinutes: Number(block.inicioMin ?? 0),
-        durationMinutes: Number(block.duracionMin ?? 0),
-        process: block.proceso ?? null,
-        activity: block.actividad ?? null,
-        isClinical: Boolean(block.clinica ?? true),
-        hasPerformance: Boolean(block.tieneRendimiento ?? true),
-        performance: Number(block.rendimiento ?? 0),
-        box: block.box ?? null,
-        observations: block.observaciones ?? null,
-        isShift: Boolean(block.esTurno ?? false),
-      },
-    });
+  const blocksData = agenda.bloquesProf
+    .filter((block) => professionalMap.has(String(block.profesionalId)))
+    .map((block) => ({
+      id: randomUUID(),
+      agendaId: agendaRecord.id,
+      professionalId: professionalMap.get(String(block.profesionalId)),
+      externalId: String(block.id),
+      day: block.dia,
+      startMinutes: Number(block.inicioMin ?? 0),
+      durationMinutes: Number(block.duracionMin ?? 0),
+      process: block.proceso ?? null,
+      activity: block.actividad ?? null,
+      isClinical: Boolean(block.clinica ?? true),
+      hasPerformance: Boolean(block.tieneRendimiento ?? true),
+      performance: Number(block.rendimiento ?? 0),
+      box: block.box ?? null,
+      observations: block.observaciones ?? null,
+      isShift: Boolean(block.esTurno ?? false),
+    }));
+  if (blocksData.length > 0) {
+    await prismaOrTx.agendaBlock.createMany({ data: blocksData });
   }
 
-  for (let index = 0; index < agenda.historial.length; index += 1) {
-    const entry = agenda.historial[index];
-    await prismaOrTx.agendaHistory.create({
-      data: {
-        agendaId: agendaRecord.id,
-        externalId: entry.id ? String(entry.id) : null,
-        dateLabel: entry.fecha ?? '',
-        action: entry.accion ?? '',
-        userName: entry.usuario ?? '',
-        comment: entry.comentario ?? null,
-        sortOrder: index,
-      },
-    });
+  if (agenda.historial.length > 0) {
+    const historyData = agenda.historial.map((entry, index) => ({
+      id: randomUUID(),
+      agendaId: agendaRecord.id,
+      externalId: entry.id ? String(entry.id) : null,
+      dateLabel: entry.fecha ?? '',
+      action: entry.accion ?? '',
+      userName: entry.usuario ?? '',
+      comment: entry.comentario ?? null,
+      sortOrder: index,
+    }));
+    await prismaOrTx.agendaHistory.createMany({ data: historyData });
   }
 
   return agendaRecord;

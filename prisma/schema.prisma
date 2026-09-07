@@ -90,16 +90,22 @@ model AgendaProfessional {
   trainingLevel String?
   isShiftOnly Boolean     @default(false)
   hasTurno   Boolean      @default(false)
+  // RUT normalizado (solo dígitos, sin puntos/guión/DV) — permite cruzar contra el reporte de
+  // RRHH (Dotación) por identificador único en vez de por nombre. Opcional: no todos los
+  // profesionales ya cargados lo tienen todavía.
+  rut        String?
   sortOrder  Int          @default(0)
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt
   agenda     Agenda       @relation(fields: [agendaId], references: [id], onDelete: Cascade)
   blocks     AgendaBlock[]
   shiftRotationMemberships ShiftRotationMember[]
-  shiftRotationOverrides   ShiftRotationOverride[]
+  shiftRotationOverrides      ShiftRotationOverride[] @relation("ShiftOverrideDay")
+  shiftRotationOverridesNight ShiftRotationOverride[] @relation("ShiftOverrideNight")
 
   @@unique([agendaId, externalId])
   @@index([agendaId, type])
+  @@index([rut])
 }
 
 model AgendaBlock {
@@ -289,9 +295,57 @@ model ShiftRotationOverride {
   professionalId   String?
   professionalName String
   note             String?
+  // Cobertura dividida (ej. feriado legal cubierto por 2 personas en el mismo puesto): cuando
+  // estos campos no son null, el turno completo de la rotación se reemplaza por DOS sub-turnos
+  // ese día en vez de uno solo — el de arriba (professionalId/professionalName) pasa a ser el
+  // tramo "día" 08:00-20:00, y estos campos son el tramo "noche" 20:00-08:00.
+  splitProfessionalId   String?
+  splitProfessionalName String?
 
-  rotation     ShiftRotation       @relation(fields: [rotationId], references: [id], onDelete: Cascade)
-  professional AgendaProfessional? @relation(fields: [professionalId], references: [id], onDelete: SetNull)
+  rotation          ShiftRotation       @relation(fields: [rotationId], references: [id], onDelete: Cascade)
+  professional      AgendaProfessional? @relation("ShiftOverrideDay", fields: [professionalId], references: [id], onDelete: SetNull)
+  splitProfessional AgendaProfessional? @relation("ShiftOverrideNight", fields: [splitProfessionalId], references: [id], onDelete: SetNull)
 
   @@unique([rotationId, date])
+}
+
+// Snapshot del reporte de RRHH "Dotación" (una fila por línea de contrato — una persona puede
+// tener varias). Cada carga nueva REEMPLAZA todo el contenido anterior; no se guarda histórico
+// de cortes previos, solo el más reciente.
+model HrContract {
+  id                   String    @id @default(cuid())
+  rut                  String
+  dv                   String
+  nombreFuncionario    String
+  planta               String
+  calidadJuridica      String
+  ley                  String
+  numeroHoras          Float?
+  unidadDescripcion    String?
+  cargo                String?
+  funcionDescripcion   String?
+  fechaInicioContrato  DateTime?
+  fechaTerminoContrato DateTime?
+  transitorio          Boolean   @default(false)
+  createdAt            DateTime  @default(now())
+
+  @@index([rut])
+}
+
+// Snapshot de la planificación semanal de pabellón (plantilla, no fechas reales — igual que la
+// jornada). Una fila por celda de la grilla (pabellón + jornada + día): qué especialidad tiene
+// asignado ese pabellón. Cada carga nueva reemplaza todo el contenido anterior. Una celda puede
+// traer más de una especialidad separadas por "/" (uso compartido) — se guarda tal cual viene,
+// el mapeo a servicios se resuelve al leer, no al importar (así una especialidad que se carga
+// después empieza a cruzar sin tener que reimportar esta planilla).
+model PabellonAllocation {
+  id                String   @id @default(cuid())
+  grupo             String   // "Pabellón Cirugía Mayor Ambulatoria" | "Pabellón Cirugía Mayor"
+  pabellon          String   // "31", "1", etc.
+  jornada           String   // "Mañana" | "Tarde"
+  dia               String   // "Lunes".."Sábado"
+  especialidadTexto String   // texto tal cual en la planilla, ej. "Cir. A. /Oftalmologia"
+  createdAt         DateTime @default(now())
+
+  @@index([dia, jornada])
 }
