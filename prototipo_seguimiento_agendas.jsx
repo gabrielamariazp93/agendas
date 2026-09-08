@@ -6766,7 +6766,7 @@ export default function App() {
           estado={agendaEnEditor.estado}
           role={role}
           esNueva={agendaEnEditor.pendienteConfirmar}
-          especialidad={ESPECIALIDAD_POR_SERVICIO[agendaEnEditor.servicio] || 'No Aplica'}
+          especialidad={services.find((s) => s.name === agendaEnEditor.servicio)?.specialtyCatalog || 'No Aplica'}
           servicioId={agendaEnEditor.servicioId}
           agendaId={agendaEnEditor.id}
           profesionales={agendaEnEditor.profesionales}
