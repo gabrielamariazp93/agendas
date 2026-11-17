@@ -18,3 +18,41 @@ body {
 * {
   box-sizing: border-box;
 }
+
+/* Impresión del Resumen general de una agenda como comprobante de revisión (botón "Descargar
+   PDF" en EditorProgramacion, que llama a window.print()). El editor vive en un contenedor
+   position:fixed con overflow:hidden para el layout normal en pantalla, lo que corta el
+   contenido al imprimir si no se resetea explícitamente. */
+@media print {
+  /* Por defecto los navegadores no imprimen colores de fondo (para ahorrar tinta) — el heatmap
+     de "Distribución horaria" y otras celdas con color por intensidad dependen de ese fondo
+     para transmitir la información, así que hay que forzarlo explícitamente. */
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    color-adjust: exact !important;
+  }
+  body * {
+    visibility: hidden;
+  }
+  .no-imprimir {
+    display: none !important;
+  }
+  #resumen-imprimible,
+  #resumen-imprimible * {
+    visibility: visible;
+  }
+  /* El editor vive en una cadena fixed/overflow-hidden pensada para pantalla — hay que
+     resetearla completa (no solo el contenido) o el navegador recorta lo visible al imprimir. */
+  .print-reset-ancestor {
+    position: static !important;
+    inset: auto !important;
+    overflow: visible !important;
+    height: auto !important;
+    width: 100% !important;
+    display: block !important;
+  }
+  #resumen-imprimible {
+    padding: 0 !important;
+  }
+}

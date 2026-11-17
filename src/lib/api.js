@@ -299,3 +299,40 @@ export async function fetchPabellonSummary() {
 export async function fetchPabellonCapacidad(servicio) {
   return request(`/pabellon/capacidad${buildQuery({ servicio })}`);
 }
+
+export async function fetchCatalogSpecialties(profession) {
+  return request(`/catalog/specialties${buildQuery({ profession })}`);
+}
+
+function buildAgendaImportForm(file, campos) {
+  const form = new FormData();
+  form.append('file', file);
+  Object.entries(campos || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') form.append(key, value);
+  });
+  return form;
+}
+
+async function postAgendaImportForm(path, file, campos) {
+  const token = getAuthToken();
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: buildAgendaImportForm(file, campos),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(body?.error || `Request failed: ${response.status}`);
+    error.details = body;
+    throw error;
+  }
+  return body;
+}
+
+export async function previewAgendaExcel(file, campos) {
+  return postAgendaImportForm('/agendas/import-excel/preview', file, campos);
+}
+
+export async function applyAgendaExcel(file, campos) {
+  return postAgendaImportForm('/agendas/import-excel/apply', file, campos);
+}

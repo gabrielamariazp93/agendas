@@ -2,7 +2,7 @@ import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LabelList, Cell } from 'recharts';
 import {
   Bell, FileText, MessageSquare, LayoutGrid, Plus, X, ChevronDown, Pencil,
-  CheckCircle2, XCircle, ArrowUpCircle, UploadCloud, Send, Sparkles, Loader2, BarChart3, History, Users, IdCard, DoorOpen, Building2
+  CheckCircle2, XCircle, ArrowUpCircle, UploadCloud, Send, Sparkles, Loader2, BarChart3, History, Users, IdCard, DoorOpen, Building2, Download
 } from 'lucide-react';
 import {
   createAgenda,
@@ -42,6 +42,10 @@ import {
   fetchPabellonSummary,
   fetchPabellonCapacidad,
   updateAgendaFields,
+  fetchCatalogProfessions,
+  fetchCatalogSpecialties,
+  previewAgendaExcel,
+  applyAgendaExcel,
 } from './src/lib/api.js';
 
 /* ---------------------------------------------------------
@@ -3476,6 +3480,7 @@ function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesT
                     fill={seleccion.length === 0 || seleccion.some((s) => s.proceso === entry.proceso && s.actividad === entry.actividad) ? COLOR_PROCESO[entry.proceso] : '#E2E8F0'}
                   />
                 ))}
+                <LabelList dataKey="horas" position="right" formatter={(v) => (Math.round(v * 10) / 10).toString()} style={{ fontSize: 10, fill: '#475569' }} />
               </Bar>
             </BarChart>
           </ResponsiveContainer>
@@ -4378,13 +4383,22 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
   const profesionalesListados = soloBecados ? profesionales.filter((p) => p.nivelFormacion) : profesionales;
 
   return (
-    <div className="fixed inset-0 bg-white z-[60] flex flex-col">
-      <div className="border-b border-slate-200 px-5 py-3.5 flex items-center justify-between shrink-0 bg-white">
+    <div className="fixed inset-0 bg-white z-[60] flex flex-col print-reset-ancestor">
+      <div className="border-b border-slate-200 px-5 py-3.5 flex items-center justify-between shrink-0 bg-white no-imprimir">
         <div>
           <div className="font-semibold text-slate-800">Programación — {titulo}</div>
           <div className="text-xs text-slate-500">{subtitulo}{soloLectura ? ' · Solo lectura' : ''}</div>
         </div>
         <div className="flex items-center gap-2">
+          {activoId === '__resumen__' && (
+            <button
+              onClick={() => window.print()}
+              className="flex items-center gap-1.5 text-xs text-slate-600 font-medium px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50"
+              title="Genera un PDF del resumen general para enviar como comprobante de revisión"
+            >
+              <Download size={13} /> Descargar PDF
+            </button>
+          )}
           {esNueva && (
             <button onClick={() => setDialogo({ tipo: 'descartar' })} className="text-xs text-[#B6522F] hover:underline mr-1">
               Descartar
@@ -4408,8 +4422,8 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
         </div>
       </div>
 
-      <div className="flex-1 flex overflow-hidden bg-white">
-        <div className="w-48 shrink-0 border-r border-slate-200 bg-white overflow-y-auto py-2">
+      <div className="flex-1 flex overflow-hidden bg-white print-reset-ancestor">
+        <div className="w-48 shrink-0 border-r border-slate-200 bg-white overflow-y-auto py-2 no-imprimir">
           <button
             onClick={() => setActivoId('__resumen__')}
             className={`w-full flex items-center gap-1.5 text-left px-3 py-2 border-l-2 transition-colors ${activoId === '__resumen__' ? 'bg-[#EBF5F2] border-[#4C7C74] text-slate-800 font-semibold' : 'border-transparent text-slate-500 hover:bg-slate-50'}`}
@@ -4472,14 +4486,20 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
           )}
         </div>
 
-        <div className="flex-1 overflow-y-auto p-5 bg-white">
+        <div className="flex-1 overflow-y-auto p-5 bg-white print-reset-ancestor">
           {activoId === '__resumen__' ? (
-            <ResumenAgendaTab
-              profesionales={profesionales}
-              bloques={bloques}
-              proyeccionTurno={roster?.proyeccion}
-              servicio={titulo}
-            />
+            <div id="resumen-imprimible">
+              <div className="hidden print:block mb-4">
+                <div className="text-base font-semibold text-slate-800">Resumen general — {titulo}</div>
+                <div className="text-xs text-slate-500">{subtitulo} · Comprobante generado el {new Date().toLocaleDateString('es-CL', { day: '2-digit', month: 'long', year: 'numeric' })}</div>
+              </div>
+              <ResumenAgendaTab
+                profesionales={profesionales}
+                bloques={bloques}
+                proyeccionTurno={roster?.proyeccion}
+                servicio={titulo}
+              />
+            </div>
           ) : activoId === '__turno__' ? (
             <TurnoRosterTab roster={roster} servicioId={servicioId} agendaId={agendaId} profesionales={profesionales} puedeEditar={puedeEditarTurno} />
           ) : !profesional ? (
@@ -5313,6 +5333,7 @@ function ResumenDashboardTab({ agendas }) {
                     fill={seleccion.length === 0 || seleccion.some((s) => s.proceso === entry.proceso && s.actividad === entry.actividad) ? COLOR_PROCESO[entry.proceso] : '#E2E8F0'}
                   />
                 ))}
+                <LabelList dataKey="horas" position="right" formatter={(v) => (Math.round(v * 10) / 10).toString()} style={{ fontSize: 10, fill: '#475569' }} />
               </Bar>
             </BarChart>
           </ResponsiveContainer>
@@ -5781,6 +5802,294 @@ function RecursosHumanosTab({ resumen, cargando, error, planta, onCambiarPlanta,
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+// Carga masiva de una agenda completa desde Excel (menú "Cargar Agenda"). Exige coincidencia
+// exacta contra el catálogo — a diferencia de las importaciones puntuales que se hacen a mano,
+// esta ruta no adivina sinónimos ni corrige tipeos, así que quien prepara el archivo tiene que
+// usar el texto real de cada actividad. Flujo en dos pasos (validar -> confirmar) para nunca
+// escribir en la base sin que el usuario haya visto primero el detalle de lo que se va a aplicar.
+function CargarAgendaTab({ agendas }) {
+  const [modo, setModo] = useState('update');
+  const [externalId, setExternalId] = useState('');
+  const [profesiones, setProfesiones] = useState([]);
+  const [profesion, setProfesion] = useState('');
+  const [especialidades, setEspecialidades] = useState([]);
+  const [especialidad, setEspecialidad] = useState('');
+  const [archivo, setArchivo] = useState(null);
+  const [serviceName, setServiceName] = useState('');
+  const [chiefName, setChiefName] = useState('');
+  const [groupName, setGroupName] = useState('');
+  const [monthLabel, setMonthLabel] = useState('');
+  const [validFrom, setValidFrom] = useState('');
+  const [validTo, setValidTo] = useState('');
+  const [preview, setPreview] = useState(null);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState('');
+  const [aplicado, setAplicado] = useState(null);
+  // Correcciones puntuales que el usuario acepta con un clic sobre una sugerencia (ver
+  // erroresValidacion[].sugerencias) — nunca se aplican solas, cada una vuelve a pasar por
+  // /preview para confirmar que el texto sugerido sí resuelve en el catálogo.
+  const [overrides, setOverrides] = useState({});
+
+  useEffect(() => {
+    fetchCatalogProfessions().then(setProfesiones).catch(() => setProfesiones([]));
+  }, []);
+
+  useEffect(() => {
+    setEspecialidad('');
+    if (!profesion) { setEspecialidades([]); return; }
+    fetchCatalogSpecialties(profesion).then(setEspecialidades).catch(() => setEspecialidades([]));
+  }, [profesion]);
+
+  function construirCampos(overridesActuales = overrides) {
+    const base = { mode: modo, profession: profesion, specialty: especialidad };
+    if (Object.keys(overridesActuales).length > 0) base.overrides = JSON.stringify(overridesActuales);
+    if (modo === 'update') return { ...base, externalId };
+    return { ...base, serviceName, chiefName, groupName, monthLabel, validFrom, validTo };
+  }
+
+  const formularioListo = Boolean(
+    archivo && profesion && especialidad && (modo === 'update' ? externalId : serviceName.trim())
+  );
+
+  async function handleValidar(overridesActuales = overrides) {
+    setCargando(true); setError(''); setPreview(null); setAplicado(null);
+    try {
+      const resultado = await previewAgendaExcel(archivo, construirCampos(overridesActuales));
+      setPreview(resultado);
+    } catch (e) {
+      setError(e.message || 'No se pudo validar el archivo.');
+    } finally {
+      setCargando(false);
+    }
+  }
+
+  function handleAceptarSugerencia(actividad, sugerencia) {
+    const nuevos = { ...overrides, [actividad]: sugerencia };
+    setOverrides(nuevos);
+    handleValidar(nuevos);
+  }
+
+  async function handleConfirmar() {
+    setCargando(true); setError('');
+    try {
+      const resultado = await applyAgendaExcel(archivo, construirCampos());
+      setAplicado(resultado);
+      setPreview(null);
+      setArchivo(null);
+    } catch (e) {
+      setError(e.message || 'No se pudo aplicar la importación.');
+    } finally {
+      setCargando(false);
+    }
+  }
+
+  return (
+    <div className="h-full overflow-auto p-4 md:p-5 space-y-4 max-w-3xl">
+      <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl p-3">
+        Sube un Excel con una hoja por profesional (bloque RUT/NOMBRE/ESPECIALIDAD arriba + grilla
+        DIA/DESDE/HASTA/ACTIVIDAD/BOX/CUPOS abajo). Si una actividad no coincide exacto con el
+        catálogo, se te muestran sugerencias por similitud para aceptar con un clic — nunca se
+        corrige nada sin que la confirmes tú.
+      </div>
+
+      <div className="flex items-center gap-2">
+        {[{ id: 'update', label: 'Actualizar agenda existente' }, { id: 'create', label: 'Crear especialidad nueva' }].map((m) => (
+          <button
+            key={m.id}
+            onClick={() => { setModo(m.id); setPreview(null); setAplicado(null); setError(''); setOverrides({}); }}
+            className={`text-xs px-3 py-1.5 rounded-full border ${modo === m.id ? 'bg-[#4C7C74] text-white border-[#4C7C74]' : 'bg-white text-slate-500 border-slate-300 hover:border-slate-400'}`}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
+        {modo === 'update' ? (
+          <div>
+            <label className="block text-[11px] text-slate-500 mb-1">Agenda a actualizar</label>
+            <select value={externalId} onChange={(e) => setExternalId(e.target.value)} className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2 bg-white">
+              <option value="">Selecciona una agenda...</option>
+              {agendas.map((a) => (
+                <option key={a.id} value={a.id}>{a.servicio} (v{a.version})</option>
+              ))}
+            </select>
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-3">
+            <div className="col-span-2">
+              <label className="block text-[11px] text-slate-500 mb-1">Nombre del servicio</label>
+              <input value={serviceName} onChange={(e) => setServiceName(e.target.value)} placeholder="Ej. Urología Adulto" className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2" />
+            </div>
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-1">Jefe de servicio (opcional)</label>
+              <input value={chiefName} onChange={(e) => setChiefName(e.target.value)} className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2" />
+            </div>
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-1">Grupo (opcional, ej. "Ginecología y Obstetricia")</label>
+              <input value={groupName} onChange={(e) => setGroupName(e.target.value)} className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2" />
+            </div>
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-1">Mes / periodo</label>
+              <input value={monthLabel} onChange={(e) => setMonthLabel(e.target.value)} placeholder="Ej. Septiembre - Diciembre 2026" className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2" />
+            </div>
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-1">Vigente desde</label>
+              <input type="date" value={validFrom} onChange={(e) => setValidFrom(e.target.value)} className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2" />
+            </div>
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-1">Vigente hasta</label>
+              <input type="date" value={validTo} onChange={(e) => setValidTo(e.target.value)} className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2" />
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[11px] text-slate-500 mb-1">Profesión</label>
+            <select value={profesion} onChange={(e) => setProfesion(e.target.value)} className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2 bg-white">
+              <option value="">Selecciona...</option>
+              {profesiones.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[11px] text-slate-500 mb-1">Especialidad (catálogo)</label>
+            <select value={especialidad} onChange={(e) => setEspecialidad(e.target.value)} disabled={!profesion} className="w-full text-xs rounded-lg border border-slate-300 px-2.5 py-2 bg-white disabled:bg-slate-50">
+              <option value="">{profesion ? 'Selecciona...' : 'Elige una profesión primero'}</option>
+              {especialidades.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label className="block text-[11px] text-slate-500 mb-1">Archivo Excel</label>
+          <input
+            type="file"
+            accept=".xlsx,.xls"
+            onChange={(e) => { setArchivo(e.target.files?.[0] || null); setPreview(null); setAplicado(null); setError(''); setOverrides({}); }}
+            className="w-full text-xs"
+          />
+        </div>
+
+        <button
+          onClick={handleValidar}
+          disabled={!formularioListo || cargando}
+          className="flex items-center gap-1.5 text-xs font-medium px-3 py-2 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {cargando ? <Loader2 size={13} className="animate-spin" /> : <UploadCloud size={13} />} Validar archivo
+        </button>
+      </div>
+
+      {error && (
+        <div className="text-xs text-[#B6522F] bg-[#FBEEE8] border border-[#F0C7B4] rounded-xl p-3">{error}</div>
+      )}
+
+      {preview && (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="text-xs font-semibold text-slate-700">
+              {preview.totalProfesionales} profesionales · {preview.totalBloques} bloques
+            </div>
+            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${preview.puedeAplicar ? 'bg-[#EBF5F2] text-[#4C7C74]' : 'bg-[#FBEEE8] text-[#B6522F]'}`}>
+              {preview.puedeAplicar ? 'Listo para aplicar' : `${preview.erroresValidacion.length} error(es)`}
+            </span>
+          </div>
+
+          {Object.keys(overrides).length > 0 && (
+            <div className="text-[11px] bg-[#F1EDFB] border border-[#DCD1F2] rounded-lg p-2.5 space-y-1">
+              <div className="font-medium text-slate-600">Correcciones aceptadas:</div>
+              {Object.entries(overrides).map(([original, corregido]) => (
+                <div key={original} className="flex items-center justify-between gap-2">
+                  <span className="text-slate-500 truncate">"{original}" → "{corregido}"</span>
+                  <button
+                    onClick={() => {
+                      const nuevos = { ...overrides };
+                      delete nuevos[original];
+                      setOverrides(nuevos);
+                      handleValidar(nuevos);
+                    }}
+                    className="text-[10px] text-[#B6522F] hover:underline shrink-0"
+                  >
+                    Deshacer
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {preview.erroresValidacion.length > 0 && (
+            <div className="text-xs">
+              <div className="font-medium text-slate-600 mb-1">Actividades sin coincidencia exacta en el catálogo:</div>
+              <ul className="space-y-2">
+                {preview.erroresValidacion.map((err) => (
+                  <li key={err.actividad}>
+                    <div className="text-[#B6522F]">"{err.actividad}" — {err.mensaje}</div>
+                    {err.sugerencias.length > 0 ? (
+                      <div className="flex items-center flex-wrap gap-1.5 mt-1">
+                        <span className="text-[10px] text-slate-400">¿Quisiste decir?</span>
+                        {err.sugerencias.map((s) => (
+                          <button
+                            key={s}
+                            onClick={() => handleAceptarSugerencia(err.actividad, s)}
+                            disabled={cargando}
+                            className="text-[11px] px-2 py-1 rounded-full border border-[#BFE0D6] bg-[#EBF5F2] text-[#4C7C74] hover:bg-[#DCEEE8] disabled:opacity-50"
+                          >
+                            {s}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-[10px] text-slate-400 mt-0.5">Sin sugerencias parecidas — corrige el texto en el Excel y vuelve a validar.</div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="text-xs">
+            <div className="font-medium text-slate-600 mb-1">Profesionales detectados:</div>
+            <ul className="space-y-0.5 max-h-48 overflow-y-auto">
+              {preview.profesionales.map((p) => (
+                <li key={p.sheet} className="text-slate-500">
+                  {p.nombre} {p.rut ? `(${p.rut})` : '(sin RUT)'} — {p.bloques} bloques
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {preview.omitidas.length > 0 && (
+            <details className="text-[11px] text-slate-400">
+              <summary className="cursor-pointer">{preview.omitidas.length} hoja(s) omitida(s) (resúmenes/plantillas)</summary>
+              <ul className="mt-1 space-y-0.5">
+                {preview.omitidas.map((o) => <li key={o.sheet}>{o.sheet}: {o.motivo}</li>)}
+              </ul>
+            </details>
+          )}
+
+          {preview.puedeAplicar && (
+            <button
+              onClick={handleConfirmar}
+              disabled={cargando}
+              style={{ background: '#4C7C74' }}
+              className="flex items-center gap-1.5 text-white text-xs font-medium px-3 py-2 rounded-lg disabled:opacity-50"
+            >
+              {cargando ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />} Confirmar e importar
+            </button>
+          )}
+        </div>
+      )}
+
+      {aplicado && (
+        <div className="text-xs text-[#4C7C74] bg-[#EBF5F2] border border-[#BFE0D6] rounded-xl p-3">
+          Importado correctamente: {aplicado.profesionales} profesionales, {aplicado.bloques} bloques
+          en la agenda "{aplicado.externalId}".
+        </div>
+      )}
     </div>
   );
 }
@@ -6292,6 +6601,10 @@ export default function App() {
   }
 
   const HR_ROLES = ['admin', 'subdirector', 'referente_programacion'];
+  // Distinto de HR_ROLES a propósito: cargar agendas por Excel exige conocer el texto exacto del
+  // catálogo (sin corrección automática de sinónimos), así que se restringe a admin/referente en
+  // vez de abrirlo también a subdirector.
+  const IMPORT_AGENDA_ROLES = ['admin', 'referente_programacion'];
 
   async function refreshHrSummary(planta) {
     if (!authUser || !HR_ROLES.includes(authUser.role)) return;
@@ -6567,8 +6880,8 @@ export default function App() {
   }
 
   return (
-    <div className="w-full h-screen bg-[#F4F2ED] flex flex-col font-sans text-slate-800 overflow-hidden">
-      <div className="bg-[#1E2E33] px-5 py-3 flex items-center justify-between shrink-0">
+    <div className="w-full h-screen bg-[#F4F2ED] flex flex-col font-sans text-slate-800 overflow-hidden print-reset-ancestor">
+      <div className="bg-[#1E2E33] px-5 py-3 flex items-center justify-between shrink-0 no-imprimir">
         <div>
           <div className="text-white font-semibold text-sm tracking-tight">Seguimiento de Agendas Institucionales</div>
           <div className="text-[#9FB0B5] text-[11px] font-mono">DDI · Hospital San Juan de Dios de La Serena</div>
@@ -6646,7 +6959,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className="flex gap-1 px-5 pt-3 shrink-0">
+      <div className="flex gap-1 px-5 pt-3 shrink-0 no-imprimir">
         {[
           { id: 'tablero', label: 'Tablero', icon: LayoutGrid },
           { id: 'resumen', label: 'Resumen de Horas', icon: BarChart3 },
@@ -6654,6 +6967,7 @@ export default function App() {
           ...(role === 'admin' ? [{ id: 'usuarios', label: 'Usuarios', icon: Users }] : []),
           ...(HR_ROLES.includes(role) ? [{ id: 'rrhh', label: 'Recursos Humanos', icon: IdCard }] : []),
           ...(HR_ROLES.includes(role) ? [{ id: 'infraestructura', label: 'Infraestructura', icon: Building2 }] : []),
+          ...(IMPORT_AGENDA_ROLES.includes(role) ? [{ id: 'cargar-agenda', label: 'Cargar Agenda', icon: UploadCloud }] : []),
           { id: 'docs', label: 'Documentos normativos', icon: FileText },
           { id: 'chat', label: 'Chat IA', icon: MessageSquare },
         ].map((t) => (
@@ -6667,7 +6981,7 @@ export default function App() {
         ))}
       </div>
 
-      <div className="flex-1 bg-white overflow-hidden">
+      <div className="flex-1 bg-white overflow-hidden no-imprimir">
         {tab === 'tablero' && (
           <div className="h-full overflow-x-auto p-4">
             <div className="flex gap-3 h-full min-w-max">
@@ -6721,6 +7035,9 @@ export default function App() {
             errorPabellon={errorPabellon}
             onSubirPlanillaPabellon={handleUploadPabellonPlan}
           />
+        )}
+        {tab === 'cargar-agenda' && IMPORT_AGENDA_ROLES.includes(role) && (
+          <CargarAgendaTab agendas={agendas} />
         )}
         {tab === 'docs' && <DocsTab />}
         {tab === 'chat' && <ChatIA />}

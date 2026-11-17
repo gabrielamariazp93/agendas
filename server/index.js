@@ -23,6 +23,7 @@ import {
 } from './lib/agendas.js';
 import { normalizeRut, normalizeText, parseDotacionWorkbook } from './lib/hr.js';
 import { parsePabellonWorkbook, resolveServiciosDesdeTexto } from './lib/pabellon.js';
+import { applyAgendaImport, parseAgendaWorkbook, validateAgendaImport } from './lib/agendaImport.js';
 
 // Grilla día×bloque-30min compartida entre /api/pabellon/summary y /api/pabellon/capacidad —
 // misma estructura (Lunes-Sábado, 08:00-20:00) que usa el heatmap de "Distribución horaria" en
@@ -1572,6 +1573,155 @@ app.post('/api/agendas/sync', async (req, res) => {
   res.json({ ok: true, agendas: stored.map(serializeAgenda) });
 });
 
+// Carga de agendas completas desde un Excel (menú "Cargar agenda" del tablero) — restringido a
+// admin/referente_programacion porque exige que quien sube el archivo ya conozca el texto exacto
+// del catálogo (no hay corrección de sinónimos/tipeos automática, a diferencia de las
+// importaciones puntuales hechas a mano durante esta sesión: acá si algo no calza se rechaza con
+// el detalle, no se adivina un fallback). Dos pasos: /preview (solo valida) y /apply (escribe).
+const AGENDA_IMPORT_ROLES = ['admin', 'referente_programacion'];
+const agendaImportUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+function slugifyExternalId(serviceName) {
+  const base = normalizeText(serviceName)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+  return `${base}-${new Date().getFullYear()}`;
+}
+
+async function runAgendaImportValidation(req, res) {
+  if (!requireRoles(req, res, AGENDA_IMPORT_ROLES)) return null;
+  if (!req.file) {
+    res.status(400).json({ error: 'Falta el archivo Excel.' });
+    return null;
+  }
+  const mode = req.body?.mode === 'create' ? 'create' : 'update';
+  const profession = typeof req.body?.profession === 'string' ? req.body.profession.trim() : '';
+  const specialty = typeof req.body?.specialty === 'string' ? req.body.specialty.trim() : '';
+  if (!profession || !specialty) {
+    res.status(400).json({ error: 'profession y specialty son obligatorios.' });
+    return null;
+  }
+
+  let existingAgenda = null;
+  let nuevaAgendaConfig = null;
+  if (mode === 'update') {
+    const externalId = typeof req.body?.externalId === 'string' ? req.body.externalId.trim() : '';
+    if (!externalId) {
+      res.status(400).json({ error: 'externalId es obligatorio en modo actualizar.' });
+      return null;
+    }
+    existingAgenda = await prisma.agenda.findUnique({ where: { externalId } });
+    if (!existingAgenda) {
+      res.status(404).json({ error: `No se encontró la agenda ${externalId}.` });
+      return null;
+    }
+  } else {
+    const serviceName = typeof req.body?.serviceName === 'string' ? req.body.serviceName.trim() : '';
+    if (!serviceName) {
+      res.status(400).json({ error: 'serviceName es obligatorio en modo crear.' });
+      return null;
+    }
+    const existeServicio = await prisma.service.findUnique({ where: { name: serviceName } });
+    if (existeServicio) {
+      res.status(409).json({ error: `Ya existe un servicio llamado "${serviceName}".` });
+      return null;
+    }
+    nuevaAgendaConfig = {
+      serviceName,
+      externalId: slugifyExternalId(serviceName),
+      chiefName: typeof req.body?.chiefName === 'string' ? req.body.chiefName.trim() : '',
+      groupName: typeof req.body?.groupName === 'string' ? req.body.groupName.trim() : '',
+      monthLabel: typeof req.body?.monthLabel === 'string' && req.body.monthLabel.trim() ? req.body.monthLabel.trim() : 'Sin mes',
+      validFrom: typeof req.body?.validFrom === 'string' && req.body.validFrom.trim() ? req.body.validFrom.trim() : null,
+      validTo: typeof req.body?.validTo === 'string' && req.body.validTo.trim() ? req.body.validTo.trim() : null,
+    };
+    const yaExisteExternalId = await prisma.agenda.findUnique({ where: { externalId: nuevaAgendaConfig.externalId } });
+    if (yaExisteExternalId) {
+      res.status(409).json({ error: `Ya existe una agenda con el identificador "${nuevaAgendaConfig.externalId}" — elige otro nombre de servicio.` });
+      return null;
+    }
+  }
+
+  let parsed;
+  try {
+    parsed = parseAgendaWorkbook(req.file.buffer);
+  } catch (error) {
+    res.status(400).json({ error: `No se pudo leer el archivo: ${error.message}` });
+    return null;
+  }
+  if (parsed.profesionales.length === 0) {
+    res.status(400).json({ error: 'No se encontró ninguna hoja con formato de horario reconocible (RUT/NOMBRE/ESPECIALIDAD + grilla DIA/DESDE/HASTA/ACTIVIDAD).' });
+    return null;
+  }
+
+  let overrides = {};
+  if (typeof req.body?.overrides === 'string' && req.body.overrides.trim()) {
+    try {
+      overrides = JSON.parse(req.body.overrides);
+    } catch (_error) {
+      res.status(400).json({ error: 'overrides no es un JSON válido.' });
+      return null;
+    }
+  }
+
+  const { catalogMap, errores } = await validateAgendaImport(prisma, parsed.profesionales, { profession, specialty, overrides });
+
+  return { mode, profession, specialty, existingAgenda, nuevaAgendaConfig, parsed, catalogMap, errores };
+}
+
+function summarizeImportPreview(ctx) {
+  let totalBloques = 0;
+  const profesionales = ctx.parsed.profesionales.map((p) => {
+    totalBloques += p.bloques.length;
+    return { sheet: p.sheet, nombre: p.nombre, rut: p.rut, especialidad: p.especialidad, bloques: p.bloques.length, advertencias: p.advertencias };
+  });
+  return {
+    mode: ctx.mode,
+    profesionales,
+    omitidas: ctx.parsed.omitidas,
+    erroresValidacion: ctx.errores,
+    totalProfesionales: profesionales.length,
+    totalBloques,
+    puedeAplicar: ctx.errores.length === 0,
+  };
+}
+
+app.post('/api/agendas/import-excel/preview', agendaImportUpload.single('file'), async (req, res) => {
+  const ctx = await runAgendaImportValidation(req, res);
+  if (!ctx) return;
+  res.json(summarizeImportPreview(ctx));
+});
+
+app.post('/api/agendas/import-excel/apply', agendaImportUpload.single('file'), async (req, res) => {
+  const ctx = await runAgendaImportValidation(req, res);
+  if (!ctx) return;
+  if (ctx.errores.length > 0) {
+    res.status(400).json({ error: 'Hay actividades sin match en el catálogo, no se puede aplicar.', ...summarizeImportPreview(ctx) });
+    return;
+  }
+
+  const resultado = await prisma.$transaction(
+    (tx) => applyAgendaImport(tx, {
+      mode: ctx.mode,
+      profession: ctx.profession,
+      specialty: ctx.specialty,
+      profesionales: ctx.parsed.profesionales,
+      catalogMap: ctx.catalogMap,
+      existingAgenda: ctx.existingAgenda,
+      nuevaAgendaConfig: ctx.nuevaAgendaConfig,
+    }),
+    { timeout: 120000, maxWait: 20000 },
+  );
+
+  await createAudit(prisma, resultado.agendaId, req.authUser, ctx.mode === 'update' ? 'update' : 'create', 'agenda', resultado.externalId, {
+    origen: 'import-excel',
+    profesionales: resultado.profesionales,
+    bloques: resultado.bloques,
+  });
+
+  res.status(201).json(resultado);
+});
+
 app.delete('/api/agendas/:externalId', async (req, res) => {
   if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
 
@@ -2030,6 +2180,29 @@ app.get('/api/catalog/professions', async (req, res) => {
   });
 
   res.json(rows.map((row) => row.profession));
+});
+
+// Especialidades reales disponibles en el catálogo para una profesión — se usa para poblar el
+// selector de "Cargar agenda (Excel)": solo se puede crear/actualizar una agenda contra una
+// especialidad que ya tenga actividades catalogadas (si no existe, primero hay que ampliar el
+// catálogo, igual que el bloqueo ya conocido de SEO/odontología).
+app.get('/api/catalog/specialties', async (req, res) => {
+  if (!requireAuth(req, res)) return;
+
+  const profession = typeof req.query.profession === 'string' ? req.query.profession.trim() : '';
+  if (!profession) {
+    res.status(400).json({ error: 'profession es obligatorio.' });
+    return;
+  }
+
+  const rows = await prisma.catalogActivity.findMany({
+    where: { profession },
+    distinct: ['specialty'],
+    select: { specialty: true },
+    orderBy: { specialty: 'asc' },
+  });
+
+  res.json(rows.map((row) => row.specialty));
 });
 
 app.get('/api/catalog/reference-performance', async (req, res) => {
