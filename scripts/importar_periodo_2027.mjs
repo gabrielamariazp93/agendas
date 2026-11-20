@@ -63,7 +63,58 @@ const ARCHIVOS = [
     profesion: () => MEDICO,
     especialidad: () => null,
   },
+  // CESAM Centro: 4 planillas (médica/profesionales × adulto/infantoadolescente) en una sola agenda
+  // por dispositivo, igual que cesamcentro-2026. La hoja no trae la profesión de los no médicos:
+  // se toma de PROFESION_CESAM_CENTRO (agenda 2026 + confirmación del usuario para los nuevos).
+  ...[
+    ['Programación médica 2027 Cesam centro adultos - Enero.xlsx', true, false],
+    ['Programacion médica 2027 Cesam Centro Infantoadolescente - Enero.xlsx', true, true],
+    ['Programación profesionales 2027 Cesam Centro Adulto - Enero.xlsx', false, false],
+    ['Programación profesionales 2027 Cesam Centro Infantoadolescente - Enero.xlsx', false, true],
+  ].map(([archivo, medica, infanto]) => ({
+    archivo: `Salud Mental/Cesam Centro/${archivo}`,
+    destino: () => 'Salud Mental CESAM Centro',
+    profesion: (pr) => (medica ? MEDICO : PROFESION_CESAM_CENTRO[normalizeText(pr.nombre)] ?? null),
+    especialidad: () => (infanto ? 'PSIQUIATRÍA PEDIÁTRICA Y DE LA ADOLESCENCIA' : null),
+    renombrar: RENOMBRAR_CESAM,
+  })),
 ];
+
+// CESAM: textos de planilla → actividad del catálogo, con el mismo criterio de cesamcentro-2026.
+// Se aplica ANTES de buscar en el catálogo (aunque el texto exista tal cual, ej. Visita Domiciliaria).
+// Valor: texto, o función (profesión) → texto | undefined (undefined = sin cambio).
+function RENOMBRAR_CESAM(texto, profesion) {
+  const med = profesion === MEDICO;
+  const t = normalizeText(texto).replace(/\s+/g, ' ');
+  const reglas = {
+    // Criterio 2026 confirmado para 2027: visita domiciliaria → visita integral.
+    'VISITA DOMICILIARIA': 'Visita Integral de Salud Mental (SM)',
+    'TRABAJO SECTORIAL': 'Trabajo sectorial (SM)',
+    'TRABAJO INTERSECTORIAL': 'Trabajo intersectorial (SM)',
+    'CONSULTORIA CON APS O MACRORRED': med ? 'Consultoría de Salud Mental' : 'Consultoría en Salud Mental (Presencial)',
+    'CONSULTA NUEVA PRESENCIAL': med ? undefined : 'Consulta Nueva Presencial (SM)',
+    'CONSULTA CONTROL PRESENCIAL': med ? undefined : profesion === 'Psicopedagogo(a)' ? 'Consulta Control Salud Mental' : 'Consulta Control  Presencial (SM)',
+    'TELEMEDICINA: TELECONSULTA CONTROL': med || profesion === ENFERMERO ? undefined : 'Teleconsulta Control Salud Mental',
+    'INTERVENCION PSICOSOCIAL GRUPAL (SM) (INCLUYE PRESENCIAL Y REMOTO)': med ? undefined : 'Intervención Psicosocial Grupal (SM)(incluye presencial y remoto)',
+    'ACTIVIDADES DE CUIDADO DEL EQUIPO (SM)': med ? undefined : 'Actividades de cuidado del equipo',
+    'ACTIVIDADES ADMINISTRATIVAS': med ? undefined : 'OANC Actividades administrativas',
+    'GESTION DE CASOS': med || profesion === ENFERMERO ? undefined : 'Gestión de Casos SM',
+    'OTROS ACTIVIDADES CLINICAS': 'Otras Actividades Clínicas',
+  };
+  return reglas[t];
+}
+
+const PSICOLOGO = 'Psicólogo(a) Clínica';
+const AS = 'Asistente Social';
+const PROFESION_CESAM_CENTRO = Object.fromEntries(Object.entries({
+  [PSICOLOGO]: ['PSICOLOGA PATRICIA CORTES RIVERA', 'MARÍA JOSÉ CAMPOS ACEVEDO', 'DANIELA CACERES GARCIA', 'CONSTANZA ARAYA DE VILLAR',
+    'VALENTINA GARCÍA PINEDA', 'GERMAN RIVERA ROBLES', 'MARCELA VÁSQUEZ MACHUCA', 'Silvana Andrea Álvarez Gálvez', 'Leslie Naralit Rivera Araya',
+    'María Teresa Parraguez Lira', 'Marcela Torres Olivares', 'Carolina Gutiérrez Madrigal'],
+  [AS]: ['T.SOCIAL MARIA LUISA CARABANTES CASTILLO', 'Sebastián Rodrigo Araya Villegas', 'Camila Lorena Castillo Juerta', 'Carolina Alvarez Naveas'],
+  'Terapeuta Ocupacional': ['KAREN SEPULVEDA', 'Cindy Castillo Cárcamo'],
+  'Psicopedagogo(a)': ['Lucy Lya Nuñez Rojas'],
+  [ENFERMERO]: ['Pia Vega', 'Ivis Morejón Menes'],
+}).flatMap(([prof, nombres]) => nombres.map((n) => [normalizeText(n), prof])));
 
 // Equivalencias para textos de planilla que no existen tal cual en el catálogo. Clave: texto
 // normalizado (normalizeText). Valor: actividad del catálogo, o un objeto por servicio/profesión.
@@ -173,7 +224,7 @@ for (const cfg of ARCHIVOS.filter((c) => !SOLO || c.archivo.toLowerCase().includ
   for (const pr of parsed.profesionales) {
     const servicio = cfg.destino(pr);
     if (!porServicio.has(servicio)) porServicio.set(servicio, []);
-    porServicio.get(servicio).push({ pr, profesion: cfg.profesion(pr), especialidad: cfg.especialidad(pr), archivo: cfg.archivo });
+    porServicio.get(servicio).push({ pr, profesion: cfg.profesion(pr), especialidad: cfg.especialidad(pr), archivo: cfg.archivo, renombrar: cfg.renombrar });
   }
 }
 
@@ -193,7 +244,8 @@ for (const [servicioNombre, profs] of porServicio) {
   if (existe && existe._count.audits > 0) { errores.push(`La agenda ${externalId} ya fue editada en la plataforma (${existe._count.audits} cambios) — no se reemplaza.`); continue; }
 
   const profesionales = [];
-  for (const { pr, profesion, especialidad } of profs) {
+  for (const { pr, profesion, especialidad, renombrar } of profs) {
+    if (!profesion) { errores.push(`${servicioNombre} › ${pr.nombre}: profesión desconocida`); continue; }
     const esp = especialidad || servicio.specialtyCatalog;
     const candidatos = catalogo.filter((c) => c.profession === profesion && (c.specialty === esp || c.specialty === 'No Aplica'));
     const buscar = (texto) => {
@@ -203,8 +255,14 @@ for (const [servicioNombre, profs] of porServicio) {
     };
     const bloques = [];
     for (const b of pr.bloques) {
-      let cat = buscar(b.actividad);
+      const renombre = typeof renombrar === 'function' ? renombrar(b.actividad, profesion) : undefined;
+      let cat = buscar(renombre || b.actividad);
       let eq = null;
+      if (renombre && cat) {
+        const key = `${b.actividad}  →  ${cat.process}: ${cat.activity}`;
+        const u = usadas.get(key) || { n: 0, revisar: /VISITA DOMICILIARIA/.test(normalizeText(b.actividad)), servicios: new Set() };
+        u.n++; u.servicios.add(servicioNombre); usadas.set(key, u);
+      }
       if (!cat) {
         eq = equivalencia(b.actividad, profesion, servicioNombre);
         if (eq?.actividad) cat = buscar(eq.actividad);
@@ -282,12 +340,18 @@ await retry(() => prisma.$transaction(async (tx) => {
         distributionJson: JSON.stringify(dist),
       },
     });
+    const idsUsados = new Set();
     for (const [i, x] of p.profesionales.entries()) {
       const rutDigits = x.pr.rut ? x.pr.rut.replace(/[^0-9kK]/g, '') : null;
+      // Un RUT repetido en la planilla (error de digitación) no debe impedir la carga: el segundo
+      // profesional usa el nombre de la hoja como identificador.
+      let extId = `${p.externalId}-${rutDigits || x.pr.sheet.replace(/\W+/g, '')}`;
+      if (idsUsados.has(extId)) extId = `${p.externalId}-${rutDigits || ''}-${x.pr.sheet.replace(/\W+/g, '')}-${i}`;
+      idsUsados.add(extId);
       const prof = await tx.agendaProfessional.create({
         data: {
           agendaId: agenda.id,
-          externalId: `${p.externalId}-${rutDigits || x.pr.sheet.replace(/\W+/g, '')}`,
+          externalId: extId,
           name: x.pr.nombre,
           type: x.profesion,
           professionCatalog: x.profesion,
