@@ -2,7 +2,7 @@ import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LabelList, Cell } from 'recharts';
 import {
   Bell, FileText, MessageSquare, LayoutGrid, Plus, X, ChevronDown, Pencil,
-  CheckCircle2, XCircle, ArrowUpCircle, UploadCloud, Send, Sparkles, Loader2, BarChart3, History, Users, IdCard, DoorOpen, Building2, Download
+  CheckCircle2, XCircle, ArrowUpCircle, UploadCloud, Send, Sparkles, Loader2, BarChart3, History, Users, IdCard, DoorOpen, Building2, Download, AlertTriangle, Info
 } from 'lucide-react';
 import {
   createAgenda,
@@ -2099,20 +2099,350 @@ function horasPorActividad(bloques) {
 }
 
 // Igual que horasPorActividad, pero separa por proceso (una misma prestación puede existir en varios procesos)
+// Clave para agrupar una prestación por nombre sin importar mayúsculas, tildes ni espacios
+// (el catálogo trae variantes como "Comité clínico" / "Comité Clínico" o "(SM) (" / "(SM)(").
+function claveActividad(actividad) {
+  return (actividad || '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/\s*([()/])\s*/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Horas por prestación agrupadas por NOMBRE (claveActividad), sumando todos los procesos en que
+// aparece. `proceso` es el proceso con más horas (define el color); `procesos` trae el desglose.
 function horasPorActividadYProceso(bloques) {
   const map = {};
   bloques.forEach((b) => {
     if (b.esTurno) return;
-    const key = `${b.proceso}|||${b.actividad}`;
-    if (!map[key]) map[key] = { proceso: b.proceso, actividad: b.actividad, horas: 0 };
-    map[key].horas += b.duracionMin / 60;
+    const clave = claveActividad(b.actividad);
+    if (!map[clave]) map[clave] = { clave, horas: 0, procesos: {}, variantes: {} };
+    const h = b.duracionMin / 60;
+    map[clave].horas += h;
+    map[clave].procesos[b.proceso || 'Sin proceso'] = (map[clave].procesos[b.proceso || 'Sin proceso'] || 0) + h;
+    map[clave].variantes[b.actividad] = (map[clave].variantes[b.actividad] || 0) + h;
   });
   return Object.values(map)
-    .map((item) => ({ ...item, horas: Math.round(item.horas * 10) / 10 }))
+    .map((item) => {
+      const mayor = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1])[0][0];
+      return {
+        clave: item.clave,
+        actividad: mayor(item.variantes),
+        proceso: mayor(item.procesos),
+        procesos: item.procesos,
+        horas: Math.round(item.horas * 10) / 10,
+      };
+    })
     .sort((a, b) => b.horas - a.horas);
 }
 
+const formatoHoras = (v) => `${(Math.round((v || 0) * 10) / 10).toLocaleString('es-CL')} h`;
+const recortarTexto = (t, max) => (t && t.length > max ? `${t.slice(0, max - 1)}…` : t || '');
+
+// Horas (sin turno) por profesional, para el selector del mapa de calor. `claveDe(bloque)` da la
+// misma clave que usan las opciones (en el resumen general combina agenda + profesional).
+function horasPorClaveProfesional(bloques, claveDe) {
+  const map = new Map();
+  bloques.forEach((b) => {
+    if (b.esTurno) return;
+    const k = claveDe(b);
+    map.set(k, (map.get(k) || 0) + b.duracionMin / 60);
+  });
+  return map;
+}
+
+// Selector múltiple de profesionales para armar el mapa de calor con uno o varios de ellos.
+// opciones: [{ key, nombre, detalle? }]; horasPorKey: Map key -> horas (de lo que el mapa muestra).
+function SelectorProfesionalesMapa({ opciones, horasPorKey, seleccion, setSeleccion }) {
+  const [abierto, setAbierto] = useState(false);
+  const [busqueda, setBusqueda] = useState('');
+  const nombrePorKey = useMemo(() => new Map(opciones.map((o) => [o.key, o.nombre])), [opciones]);
+  const visibles = useMemo(() => {
+    const q = busqueda.trim().toLowerCase();
+    return opciones
+      .filter((o) => !q || o.nombre.toLowerCase().includes(q) || (o.detalle || '').toLowerCase().includes(q))
+      .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+  }, [opciones, busqueda]);
+  const alternar = (key) => setSeleccion((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  const horasSeleccion = seleccion.reduce((s, k) => s + (horasPorKey.get(k) || 0), 0);
+  if (opciones.length < 2) return null;
+
+  return (
+    <div className="mb-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="relative">
+          <button
+            onClick={() => setAbierto((v) => !v)}
+            className={`text-[11px] rounded-lg border px-2.5 py-1 flex items-center gap-1.5 ${seleccion.length ? 'border-[#4C7C74] text-[#2F6C5D] bg-[#EBF5F2] font-medium' : 'border-slate-300 text-slate-600 bg-white hover:bg-slate-50'}`}
+          >
+            <Users size={12} />
+            {seleccion.length === 0 ? `Profesionales: todos (${opciones.length})` : `${seleccion.length} profesional${seleccion.length === 1 ? '' : 'es'} · ${formatoHoras(horasSeleccion)}`}
+            <ChevronDown size={12} />
+          </button>
+          {abierto && (
+            <>
+              <div className="fixed inset-0 z-40" onClick={() => setAbierto(false)} />
+              <div className="absolute left-0 top-8 z-50 w-80 bg-white rounded-xl border border-slate-200 shadow-lg">
+                <div className="p-2 border-b border-slate-100">
+                  <input
+                    autoFocus
+                    value={busqueda}
+                    onChange={(e) => setBusqueda(e.target.value)}
+                    placeholder="Buscar profesional..."
+                    className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:outline-none"
+                  />
+                </div>
+                <div className="max-h-64 overflow-y-auto py-1">
+                  {visibles.length === 0 && <div className="px-3 py-3 text-xs text-slate-400 italic">Sin resultados.</div>}
+                  {visibles.map((o) => (
+                    <label key={o.key} className="flex items-center gap-2 px-3 py-1.5 hover:bg-slate-50 cursor-pointer">
+                      <input type="checkbox" checked={seleccion.includes(o.key)} onChange={() => alternar(o.key)} />
+                      <span className="flex-1 min-w-0">
+                        <span className="block text-xs text-slate-700 truncate">{o.nombre}</span>
+                        {o.detalle && <span className="block text-[10px] text-slate-400 truncate">{o.detalle}</span>}
+                      </span>
+                      <span className="text-[10px] text-slate-400 shrink-0">{formatoHoras(horasPorKey.get(o.key) || 0)}</span>
+                    </label>
+                  ))}
+                </div>
+                {seleccion.length > 0 && (
+                  <div className="px-3 py-1.5 border-t border-slate-100 bg-[#EBF5F2] text-[11px] text-[#2F6C5D]">
+                    Suma de {seleccion.length} profesional{seleccion.length === 1 ? '' : 'es'}: <b>{formatoHoras(horasSeleccion)}</b>
+                  </div>
+                )}
+                <div className="flex justify-between items-center px-3 py-2 border-t border-slate-100">
+                  <button onClick={() => setSeleccion([])} className="text-[11px] text-slate-500 hover:text-slate-700">Limpiar</button>
+                  <button onClick={() => setAbierto(false)} className="text-[11px] font-medium text-[#4C7C74] hover:underline">Listo</button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+        {seleccion.length > 0 && (
+          <>
+            {seleccion.map((k) => (
+              <span key={k} className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded-full pl-2 pr-1 py-0.5">
+                {recortarTexto(nombrePorKey.get(k) || k, 28)}
+                <button onClick={() => alternar(k)} className="text-slate-400 hover:text-slate-700" title="Quitar"><X size={10} /></button>
+              </span>
+            ))}
+            <button onClick={() => setSeleccion([])} className="text-[11px] font-medium text-[#4C7C74] hover:underline">Ver todos los profesionales</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Gráfico de barras horizontales de horas por prestación (todas, no un top N), ordenable por
+// horas o por nombre. Las barras son clicables para combinar prestaciones en la distribución
+// horaria; "Ver todas las prestaciones" (arriba, junto al título) limpia esa selección.
+function GraficoHorasPorPrestacion({ datos, seleccion, setSeleccion }) {
+  const [orden, setOrden] = useState('horas');
+  const [mostrar, setMostrar] = useState('top10'); // 'top10' | 'todas'
+  const recortado = mostrar === 'top10' && datos.length > 10;
+  const ordenados = useMemo(() => {
+    // Top 10 siempre son las 10 con más horas; después se aplica el orden elegido sobre ellas.
+    const base = mostrar === 'top10' ? [...datos].sort((a, b) => b.horas - a.horas).slice(0, 10) : datos;
+    const copia = [...base];
+    if (orden === 'nombre') {
+      copia.sort((a, b) => (a.actividad || '').localeCompare(b.actividad || '', 'es', { sensitivity: 'base' }) || (a.proceso || '').localeCompare(b.proceso || ''));
+    } else {
+      copia.sort((a, b) => b.horas - a.horas);
+    }
+    return copia;
+  }, [datos, orden, mostrar]);
+  const total = datos.reduce((s, d) => s + d.horas, 0);
+  const estaSeleccionada = (e) => seleccion.some((s) => s.clave === e.clave);
+  // Suma sobre todas las prestaciones (no solo las visibles en el top 10).
+  const horasSeleccion = datos.filter(estaSeleccionada).reduce((s, d) => s + d.horas, 0);
+  const alternar = (data) => setSeleccion((prev) => (
+    prev.some((s) => s.clave === data.clave)
+      ? prev.filter((s) => s.clave !== data.clave)
+      : [...prev, { clave: data.clave, proceso: Object.keys(data.procesos || {}).join(' + ') || data.proceso, actividad: data.actividad }]
+  ));
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1.5 flex-wrap gap-2">
+        <div className="flex items-center gap-2">
+          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Horas por prestación</div>
+          <span className="text-[10px] font-semibold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded-full">{datos.length}</span>
+          <span className="text-[10px] text-slate-400">
+            {formatoHoras(total)} en total{recortado ? ` · mostrando las 10 con más horas de ${datos.length}` : ''}
+          </span>
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="text-[10px] text-slate-400">Mostrar</span>
+          <div className="inline-flex rounded-lg border border-slate-300 overflow-hidden">
+            {[{ id: 'top10', label: 'Top 10' }, { id: 'todas', label: 'Todas' }].map((o) => (
+              <button
+                key={o.id}
+                onClick={() => setMostrar(o.id)}
+                className={`text-[11px] px-2.5 py-1 ${mostrar === o.id ? 'bg-[#4C7C74] text-white font-medium' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+          <span className="text-[10px] text-slate-400 ml-1.5">Ordenar por</span>
+          <div className="inline-flex rounded-lg border border-slate-300 overflow-hidden">
+            {[{ id: 'horas', label: 'N° de horas' }, { id: 'nombre', label: 'Nombre' }].map((o) => (
+              <button
+                key={o.id}
+                onClick={() => setOrden(o.id)}
+                className={`text-[11px] px-2.5 py-1 ${orden === o.id ? 'bg-[#4C7C74] text-white font-medium' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+        <div className="flex flex-wrap gap-3">
+          {PROCESOS_CAT.map((p) => (
+            <div key={p} className="flex items-center gap-1">
+              <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: COLOR_PROCESO[p] }} />
+              <span className="text-[10px] text-slate-500">{p}</span>
+            </div>
+          ))}
+        </div>
+        {seleccion.length > 0 ? (
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-semibold text-[#4C7C74] bg-[#EBF5F2] px-2 py-0.5 rounded-full">
+              {seleccion.length} {seleccion.length === 1 ? 'seleccionada' : 'seleccionadas'}
+              {' · '}{formatoHoras(horasSeleccion)}
+              {total > 0 ? ` (${Math.round((horasSeleccion / total) * 100)}% del total)` : ''}
+            </span>
+            <button onClick={() => setSeleccion([])} className="text-[11px] font-medium text-[#4C7C74] hover:underline">
+              Ver todas las prestaciones
+            </button>
+          </div>
+        ) : (
+          <div className="text-[10px] text-slate-400">Haz clic en una o varias barras para verlas en la distribución horaria</div>
+        )}
+      </div>
+      <div className="bg-white rounded-xl border border-slate-200 p-3" style={{ height: Math.max(220, ordenados.length * 26 + 40) }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={ordenados} layout="vertical" margin={{ top: 4, right: 48, left: 4, bottom: 4 }} barCategoryGap={4}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#eee" horizontal={false} />
+            <XAxis type="number" tick={{ fontSize: 10 }} tickFormatter={(v) => `${v} h`} />
+            <YAxis
+              type="category"
+              dataKey="actividad"
+              width={260}
+              interval={0}
+              tick={({ x, y, payload }) => (
+                <text x={x} y={y} dy={3.5} textAnchor="end" fontSize={10} fill="#334155">
+                  <title>{payload.value}</title>
+                  {recortarTexto(payload.value, 44)}
+                </text>
+              )}
+            />
+            <Tooltip
+              cursor={{ fill: '#F1F5F9' }}
+              content={({ active, payload }) => {
+                if (!active || !payload?.length) return null;
+                const d = payload[0].payload;
+                const pct = (v) => (total > 0 ? ` (${Math.round((v / total) * 100)}%)` : '');
+                return (
+                  <div className="bg-white rounded-lg border border-slate-200 shadow-md px-3 py-2 text-[11px] max-w-xs">
+                    <div className="font-semibold text-slate-800 mb-0.5">{d.actividad}</div>
+                    <div className="text-slate-500">Total: <b className="text-slate-700">{formatoHoras(d.horas)}</b>{pct(d.horas)}</div>
+                    {Object.keys(d.procesos || {}).length > 1 && (
+                      <div className="mt-0.5 space-y-0.5">
+                        {Object.entries(d.procesos).sort((a, b) => b[1] - a[1]).map(([p, h]) => (
+                          <div key={p} className="flex items-center gap-1.5 text-slate-500">
+                            <span className="inline-block w-2 h-2 rounded-sm" style={{ background: COLOR_PROCESO[p] || '#94A3B8' }} />
+                            {p}: {formatoHoras(h)}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {Object.keys(d.procesos || {}).length === 1 && <div className="text-slate-400">{d.proceso}</div>}
+                    {seleccion.length > 0 && (
+                      <div className="mt-1.5 pt-1.5 border-t border-slate-100 text-[#2F6C5D]">
+                        Suma de {seleccion.length} seleccionada{seleccion.length === 1 ? '' : 's'}: <b>{formatoHoras(horasSeleccion)}</b>{pct(horasSeleccion)}
+                        {!estaSeleccionada(d) && <div className="text-slate-400 mt-0.5">Clic para sumar esta: {formatoHoras(horasSeleccion + d.horas)}</div>}
+                      </div>
+                    )}
+                  </div>
+                );
+              }}
+            />
+            <Bar dataKey="horas" radius={[0, 4, 4, 0]} cursor="pointer" maxBarSize={18} onClick={alternar}>
+              {ordenados.map((entry) => (
+                <Cell
+                  key={entry.clave}
+                  fill={seleccion.length === 0 || estaSeleccionada(entry) ? COLOR_PROCESO[entry.proceso] || '#94A3B8' : '#E2E8F0'}
+                />
+              ))}
+              <LabelList
+                dataKey="horas"
+                content={({ x, y, width, height, value }) => (
+                  <text x={x + width + 6} y={y + height / 2} dy={3.5} fontSize={10} fill="#475569">{formatoHoras(value)}</text>
+                )}
+              />
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
 const HORA_INICIO_DIA = 8;
+
+// Topes de horario: dos bloques del MISMO profesional, el mismo día, cuyos horarios se cruzan
+// (típico error de tipeo: 08:30-10:00 seguido de 09:30-...). Dos turnos entre sí no se cuentan.
+// Devuelve Map idBloque -> [bloques con los que choca].
+function detectarTopes(bloques) {
+  const topes = new Map();
+  const grupos = new Map();
+  bloques.forEach((b) => {
+    if (!b.duracionMin || b.duracionMin <= 0) return;
+    const k = `${b.profesionalId}|||${b.dia}`;
+    if (!grupos.has(k)) grupos.set(k, []);
+    grupos.get(k).push(b);
+  });
+  grupos.forEach((lista) => {
+    lista.sort((a, b) => a.inicioMin - b.inicioMin);
+    for (let i = 0; i < lista.length; i++) {
+      const a = lista[i];
+      const finA = a.inicioMin + a.duracionMin;
+      for (let j = i + 1; j < lista.length && lista[j].inicioMin < finA; j++) {
+        const b = lista[j];
+        if (a.esTurno && b.esTurno) continue;
+        if (!topes.has(a.id)) topes.set(a.id, []);
+        if (!topes.has(b.id)) topes.set(b.id, []);
+        topes.get(a.id).push(b);
+        topes.get(b.id).push(a);
+      }
+    }
+  });
+  return topes;
+}
+
+function describirTopes(lista) {
+  return lista.map((o) => `${hhmmDesdeMin(o.inicioMin)}–${horaFinTexto(o.inicioMin, o.duracionMin)} ${o.actividad || (o.esTurno ? 'Turno' : 'sin prestación')}`).join(' · ');
+}
+
+// Duración que se asume al marcar un bloque como turno: 24 h por defecto. Si algún servicio
+// trabaja con turnos más cortos se agrega aquí, ej. { neonatologia: 720 } para 12 h.
+// Clave: nombre del servicio sin tildes, en minúsculas.
+const DURACION_TURNO_POR_SERVICIO = {};
+function duracionTurnoServicio(servicio) {
+  const clave = String(servicio || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+  return DURACION_TURNO_POR_SERVICIO[clave] ?? 1440;
+}
+
+// Hora de término para mostrar: si pasa de medianoche (turnos de 24 h) se indica "+1d".
+function horaFinTexto(inicioMin, duracionMin) {
+  const fin = inicioMin + duracionMin;
+  return fin > 1440 ? `${hhmmDesdeMin(fin % 1440)} (+1d)` : hhmmDesdeMin(fin);
+}
 
 function hhmmDesdeMin(mins) {
   const h = Math.floor(mins / 60), m = Math.round(mins % 60);
@@ -2512,9 +2842,20 @@ function LoginScreen({ onLogin, loading, error }) {
   );
 }
 
-function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, nivelFormacionInicial, tieneTurnoInicial, rutInicial, onConfirmar, onCancelar }) {
+function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, nivelFormacionInicial, tieneTurnoInicial, rutInicial, especialidadInicial, especialidadServicio, onConfirmar, onCancelar }) {
   const [nombre, setNombre] = useState(nombreInicial || '');
   const [tipo, setTipo] = useState(tipoInicial || TIPOS_PROFESIONAL[0]);
+  // '' = usa la especialidad del servicio. Solo hace falta elegir otra en agendas que agrupan
+  // varias especialidades (ej. CESAM: psiquiatría adulto + infanto-juvenil).
+  const [especialidad, setEspecialidad] = useState(especialidadInicial || '');
+  const [especialidadesTipo, setEspecialidadesTipo] = useState([]);
+  useEffect(() => {
+    let cancelado = false;
+    fetchCatalogSpecialties(tipo)
+      .then((lista) => { if (!cancelado) setEspecialidadesTipo((lista || []).filter((e) => e !== 'No Aplica')); })
+      .catch(() => { if (!cancelado) setEspecialidadesTipo([]); });
+    return () => { cancelado = true; };
+  }, [tipo]);
   const [esBecado, setEsBecado] = useState(!!nivelFormacionInicial);
   const [nivelDetalle, setNivelDetalle] = useState((nivelFormacionInicial || '').replace(/^Becado\s*/i, ''));
   const [tieneTurno, setTieneTurno] = useState(!!tieneTurnoInicial);
@@ -2631,6 +2972,17 @@ function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, nivelFormacionI
             {TIPOS_PROFESIONAL.map((t) => <option key={t} value={t}>{t}</option>)}
           </select>
         </label>
+        {(especialidadesTipo.length > 0 || especialidad) && (
+          <label className="text-xs text-slate-600 font-medium block mb-2.5">
+            Especialidad
+            <select value={especialidad} onChange={(e) => setEspecialidad(e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-2 text-sm bg-white">
+              <option value="">La del servicio{especialidadServicio && especialidadServicio !== 'No Aplica' ? ` (${especialidadServicio})` : ''}</option>
+              {[...new Set([...(especialidad ? [especialidad] : []), ...especialidadesTipo])]
+                .filter((e) => e !== especialidadServicio)
+                .map((e) => <option key={e} value={e}>{e}</option>)}
+            </select>
+          </label>
+        )}
         <label className="flex items-center gap-2 text-xs text-slate-600 font-medium py-1 cursor-pointer">
           <input type="checkbox" checked={esBecado} onChange={(e) => setEsBecado(e.target.checked)} />
           Es becado / en formación
@@ -2654,7 +3006,7 @@ function ProfesionalDialog({ titulo, nombreInicial, tipoInicial, nivelFormacionI
           onClick={() => {
             if (!nombre.trim()) return;
             const nivelFormacion = esBecado ? `Becado${nivelDetalle.trim() ? ` ${nivelDetalle.trim()}` : ''}` : '';
-            onConfirmar(nombre.trim(), tipo, nivelFormacion, tieneTurno, rut);
+            onConfirmar(nombre.trim(), tipo, nivelFormacion, tieneTurno, rut, especialidad || null);
           }}
           style={{ background: '#4C7C74' }}
           className="w-full text-white text-sm font-medium py-2 rounded-lg mt-3"
@@ -2731,18 +3083,24 @@ function EditableText({ value, onCommit, className, type = 'text', ...props }) {
   );
 }
 
+// Catálogo de prestaciones por tipo de profesional|servicio|especialidad, compartido entre
+// profesionales para no volver a pedirlo al servidor (cada consulta tarda ~1 s).
+const CACHE_CATALOGO = new Map();
+
 function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, soloLectura, onAgregarFila, onEditarFila, onEliminarFila, onLimpiar, onEliminarProfesional }) {
   const [filtroDia, setFiltroDia] = useState('todos');
   const [filtroProceso, setFiltroProceso] = useState('todos');
   const [filtroPrestacion, setFiltroPrestacion] = useState('todos');
   const [filtroBox, setFiltroBox] = useState('todos');
+  const [soloTopes, setSoloTopes] = useState(false);
   const [busqueda, setBusqueda] = useState('');
 
   const diasPresentes = DIAS.filter((d) => bloques.some((b) => b.dia === d));
   const procesosPresentes = Array.from(new Set(bloques.map((b) => b.proceso).filter(Boolean))).sort();
   const prestacionesPresentes = Array.from(new Set(bloques.map((b) => b.actividad).filter(Boolean))).sort();
   const boxesPresentes = Array.from(new Set(bloques.map((b) => b.box).filter(Boolean))).sort();
-  const filtroActivo = filtroDia !== 'todos' || filtroProceso !== 'todos' || filtroPrestacion !== 'todos' || filtroBox !== 'todos' || busqueda.trim() !== '';
+  const topes = detectarTopes(bloques);
+  const filtroActivo = filtroDia !== 'todos' || filtroProceso !== 'todos' || filtroPrestacion !== 'todos' || filtroBox !== 'todos' || busqueda.trim() !== '' || soloTopes;
 
   const filas = bloques
     .slice()
@@ -2751,6 +3109,7 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
     .filter((b) => filtroProceso === 'todos' || b.proceso === filtroProceso)
     .filter((b) => filtroPrestacion === 'todos' || b.actividad === filtroPrestacion)
     .filter((b) => filtroBox === 'todos' || b.box === filtroBox)
+    .filter((b) => !soloTopes || topes.has(b.id))
     .filter((b) => {
       const q = busqueda.trim().toLowerCase();
       if (!q) return true;
@@ -2760,6 +3119,20 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
   const totalHrs = filasJornada.reduce((s, b) => s + b.duracionMin / 60, 0);
   const totalCupos = filasJornada.reduce((s, b) => s + (b.tieneRendimiento ? Math.round((b.rendimiento || 0) * (b.duracionMin / 60)) : 0), 0);
   const totalHrsTurno = filas.filter((b) => b.esTurno).reduce((s, b) => s + b.duracionMin / 60, 0);
+  // Horas por día (jornada y turno por separado) — franja superior con TODOS los bloques del
+  // profesional, y subtotal al final de cada día en la tabla con las filas visibles.
+  const horasPorDia = (lista) => {
+    const m = {};
+    lista.forEach((b) => {
+      m[b.dia] ||= { jornada: 0, turno: 0 };
+      m[b.dia][b.esTurno ? 'turno' : 'jornada'] += b.duracionMin / 60;
+    });
+    return m;
+  };
+  const horasDiaTodas = horasPorDia(bloques);
+  const horasDiaVisibles = horasPorDia(filas);
+  const fmtH = (h) => `${(Math.round(h * 10) / 10).toLocaleString('es-CL')} h`;
+  const diasSemana = [...DIAS, ...Object.keys(horasDiaTodas).filter((d) => !DIAS.includes(d))];
   const [opciones, setOpciones] = useState([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const wrapperRef = useRef(null);
@@ -2769,22 +3142,39 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
   useEffect(() => {
     let cancelled = false;
     async function loadCatalog() {
+      const clave = `${profesional.tipo}|${servicio}|${especialidad}`;
+      // Catálogo ya cargado antes para este tipo/servicio/especialidad: se muestra al instante.
+      if (CACHE_CATALOGO.has(clave)) {
+        setOpciones(CACHE_CATALOGO.get(clave));
+        return;
+      }
       setCatalogLoading(true);
       try {
-        const response = await fetchCatalogActivities({
-          profession: profesional.tipo,
-          serviceName: servicio,
-          specialty: especialidad,
-        });
-        if (!cancelled) {
-          setOpciones(
-            response.items.map((item) => ({
-              proceso: item.process,
-              actividad: item.activity,
-              clinica: item.isClinical,
-              tieneRendimiento: item.hasPerformance,
-            }))
-          );
+        // Reintenta: si la base o el servidor fallan un momento (red del hospital, reinicio),
+        // no queremos dejar la lista de prestaciones vacía hasta recargar la página.
+        let response = null;
+        for (let intento = 0; intento < 4 && !cancelled; intento++) {
+          try {
+            response = await fetchCatalogActivities({
+              profession: profesional.tipo,
+              serviceName: servicio,
+              specialty: especialidad,
+            });
+            break;
+          } catch (error) {
+            if (intento === 3) throw error;
+            await new Promise((r) => setTimeout(r, 1500 * (intento + 1)));
+          }
+        }
+        if (!cancelled && response) {
+          const items = response.items.map((item) => ({
+            proceso: item.process,
+            actividad: item.activity,
+            clinica: item.isClinical,
+            tieneRendimiento: item.hasPerformance,
+          }));
+          if (items.length) CACHE_CATALOGO.set(clave, items);
+          setOpciones(items);
         }
       } catch (_error) {
         if (!cancelled) {
@@ -2827,12 +3217,22 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
   }
 
   return (
-    <div className="max-w-4xl">
+    <div className="w-full">
       <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div>
-          <div className="text-sm font-semibold text-slate-800">{profesional.nombre} <span className="text-xs font-normal text-slate-400">· {profesional.tipo || 'Sin tipo'}</span></div>
-          <div className="text-[11px] text-slate-500">
-            {soloLectura ? 'Programación de solo lectura.' : 'Esta es la última programación cargada para este profesional. Edita cualquier celda directamente, como en una planilla.'}
+          <div className="text-sm font-semibold text-slate-800 flex items-center gap-1.5 flex-wrap">
+            {profesional.nombre} <span className="text-xs font-normal text-slate-400">· {profesional.tipo || 'Sin tipo'}</span>
+            {soloLectura ? (
+              <span className="text-[10px] font-medium text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full">Solo lectura</span>
+            ) : (
+              <span
+                className="text-slate-400 hover:text-[#4C7C74] cursor-help"
+                title={`Última programación cargada para este profesional. Edita cualquier celda directamente, como en una planilla.\n· Mueve el mouse sobre la tabla para insertar una fila en esa posición.\n· Usa el círculo rojo de cada fila para eliminarla.\n· La lista de prestaciones es la real para ${profesional.tipo || 'este tipo de profesional'}.`}
+              >
+                <Info size={14} />
+              </span>
+            )}
+            {catalogLoading && <span className="text-[10px] font-normal text-slate-400">Cargando catálogo…</span>}
           </div>
         </div>
         {!soloLectura && (
@@ -2846,13 +3246,6 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
           </div>
         )}
       </div>
-
-      {!soloLectura && (
-        <div className="text-[11px] text-slate-400 mb-1.5">
-          Mueve el mouse sobre la tabla para insertar una fila en esa posición · usa el círculo rojo de cada fila para eliminarla · la lista de prestaciones es la real para {profesional.tipo}.
-          {catalogLoading ? ' Cargando catálogo...' : ''}
-        </div>
-      )}
 
       <div className="flex flex-wrap items-center gap-2 mb-2.5">
         <select value={filtroDia} onChange={(e) => setFiltroDia(e.target.value)} className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 bg-white">
@@ -2880,7 +3273,7 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
         />
         {filtroActivo && (
           <button
-            onClick={() => { setFiltroDia('todos'); setFiltroProceso('todos'); setFiltroPrestacion('todos'); setFiltroBox('todos'); setBusqueda(''); }}
+            onClick={() => { setFiltroDia('todos'); setFiltroProceso('todos'); setFiltroPrestacion('todos'); setFiltroBox('todos'); setBusqueda(''); setSoloTopes(false); }}
             className="text-xs text-[#4C7C74] hover:underline"
           >
             Limpiar filtros
@@ -2888,19 +3281,60 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
         )}
       </div>
 
+      {bloques.length > 0 && (
+        <div className="mb-2.5 flex flex-wrap items-stretch gap-1.5">
+          <div className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide self-center mr-1">Horas por día</div>
+          {diasSemana.map((d) => {
+            const h = horasDiaTodas[d] || { jornada: 0, turno: 0 };
+            const vacio = h.jornada === 0 && h.turno === 0;
+            return (
+              <button
+                key={d}
+                onClick={() => setFiltroDia((actual) => (actual === d ? 'todos' : d))}
+                title={vacio ? `${d}: sin bloques` : `${d}: ${fmtH(h.jornada)} de jornada${h.turno ? ` + ${fmtH(h.turno)} de turno` : ''} — clic para filtrar este día`}
+                className={`rounded-lg border px-2 py-1 text-left min-w-[62px] ${filtroDia === d ? 'border-[#4C7C74] bg-[#EBF5F2]' : vacio ? 'border-slate-100 bg-slate-50/60' : 'border-slate-200 bg-white hover:bg-slate-50'}`}
+              >
+                <div className={`text-[10px] ${vacio ? 'text-slate-300' : 'text-slate-500'}`}>{d.slice(0, 3)}</div>
+                <div className={`text-xs font-semibold ${vacio ? 'text-slate-300' : 'text-slate-800'}`}>{vacio ? '—' : fmtH(h.jornada)}</div>
+                {h.turno > 0 && <div className="text-[9px] font-semibold text-[#B6522F]">+ {fmtH(h.turno)} turno</div>}
+              </button>
+            );
+          })}
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 min-w-[70px]">
+            <div className="text-[10px] text-slate-500">Semana</div>
+            <div className="text-xs font-semibold text-slate-800">{fmtH(Object.values(horasDiaTodas).reduce((s, h) => s + h.jornada, 0))}</div>
+            {Object.values(horasDiaTodas).some((h) => h.turno > 0) && (
+              <div className="text-[9px] font-semibold text-[#B6522F]">+ {fmtH(Object.values(horasDiaTodas).reduce((s, h) => s + h.turno, 0))} turno</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {topes.size > 0 && (
+        <div className="mb-2.5 rounded-lg border border-[#F2C4C4] bg-[#FDECEC] px-3 py-2 text-[11px] text-[#9B2C2C] flex items-center justify-between gap-2 flex-wrap">
+          <span className="flex items-center gap-1.5">
+            <AlertTriangle size={13} />
+            <b>{topes.size} bloques se superponen</b> en el horario de este profesional (marcados en rojo). Revisa las horas de inicio y término.
+          </span>
+          <button onClick={() => setSoloTopes((v) => !v)} className="font-medium underline">
+            {soloTopes ? 'Ver todos los bloques' : 'Ver solo los topes'}
+          </button>
+        </div>
+      )}
+
       <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
         <div ref={wrapperRef} className="relative" onMouseMove={handleMouseMove} onMouseLeave={() => setInsertPos(null)}>
-          <table className="w-full text-xs min-w-[980px]">
-            <thead className="bg-slate-50 text-slate-500">
+          <table className="w-full text-xs">
+            <thead className="bg-slate-50 text-slate-500 whitespace-nowrap">
               <tr>
                 <th className="text-left px-2.5 py-2 font-medium">Día</th>
                 <th className="text-left px-2.5 py-2 font-medium">Hora inicio</th>
                 <th className="text-left px-2.5 py-2 font-medium">Hora término</th>
-                <th className="text-left px-2.5 py-2 font-medium">Prestación</th>
-                <th className="text-left px-2.5 py-2 font-medium">Proceso</th>
-                <th className="text-left px-2.5 py-2 font-medium">Box</th>
+                <th className="text-left px-2.5 py-2 font-medium min-w-[200px]">Prestación</th>
+                <th className="text-left px-2.5 py-2 font-medium hidden xl:table-cell">Proceso</th>
+                <th className="text-left px-2.5 py-2 font-medium hidden lg:table-cell">Box</th>
                 <th className="text-right px-2.5 py-2 font-medium">Cupos</th>
-                <th className="text-right px-2.5 py-2 font-medium">Duración</th>
+                <th className="text-right px-2.5 py-2 font-medium hidden lg:table-cell" title="Minutos por cupo">Min/cupo</th>
                 <th className="text-left px-2.5 py-2 font-medium">Observaciones</th>
                 <th className="text-center px-2.5 py-2 font-medium">Turno</th>
                 {!soloLectura && <th className="w-10 text-center font-medium">Borrar</th>}
@@ -2914,47 +3348,82 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                     : soloLectura ? 'Sin actividades cargadas.' : 'Sin actividades cargadas. Mueve el mouse sobre esta área y haz clic para agregar la primera.'}
                 </td></tr>
               )}
-              {filas.map((b) => {
+              {filas.map((b, idx) => {
+                const ultimaDelDia = idx === filas.length - 1 || filas[idx + 1].dia !== b.dia;
+                const hd = horasDiaVisibles[b.dia] || { jornada: 0, turno: 0 };
+                const filaSubtotal = ultimaDelDia && (
+                  <tr className="bg-slate-50/80 border-t border-slate-200">
+                    <td colSpan={soloLectura ? 10 : 11} className="px-2.5 py-1 text-[11px] text-slate-500">
+                      {filtroActivo ? 'Subtotal' : 'Total'} {b.dia}: <b className="text-slate-700">{fmtH(hd.jornada)}</b> de jornada
+                      {hd.turno > 0 && <span className="text-[#B6522F]"> · {fmtH(hd.turno)} de turno</span>}
+                    </td>
+                  </tr>
+                );
                 const cupos = b.tieneRendimiento ? Math.round((b.rendimiento || 0) * (b.duracionMin / 60)) : null;
+                const choques = topes.get(b.id);
+                const estiloFila = choques
+                  ? { background: '#FDECEC', boxShadow: 'inset 3px 0 0 #DC2626' }
+                  : b.esTurno ? { background: '#FDF6EC' } : undefined;
+                const avisoTope = choques && (
+                  <span title={`Se superpone con: ${describirTopes(choques)}`} className="text-[#DC2626] shrink-0 cursor-help"><AlertTriangle size={12} /></span>
+                );
                 const duracionPorCupo = cupos ? Math.round((b.duracionMin / cupos) * 10) / 10 : null;
                 if (soloLectura) {
                   return (
-                    <tr key={b.id} data-fila className="border-t border-slate-100" style={b.esTurno ? { background: '#FDF6EC' } : undefined}>
-                      <td className="px-2.5 py-1.5 text-slate-600">{b.dia}</td>
+                    <React.Fragment key={b.id}>
+                    <tr data-fila className="border-t border-slate-100" style={estiloFila}>
+                      <td className="px-2.5 py-1.5 text-slate-600"><span className="inline-flex items-center gap-1">{avisoTope}{b.dia}</span></td>
                       <td className="px-2.5 py-1.5 text-slate-600">{hhmmDesdeMin(b.inicioMin)}</td>
-                      <td className="px-2.5 py-1.5 text-slate-600">{hhmmDesdeMin(b.inicioMin + b.duracionMin)}</td>
-                      <td className="px-2.5 py-1.5" style={{ color: b.proceso ? COLOR_PROCESO[b.proceso] : '#94a3b8' }}>{b.actividad || '—'}</td>
-                      <td className="px-2.5 py-1.5 text-slate-600">{b.proceso || '—'}</td>
-                      <td className="px-2.5 py-1.5 text-slate-600">{b.box || '—'}</td>
+                      <td className="px-2.5 py-1.5 text-slate-600">{horaFinTexto(b.inicioMin, b.duracionMin)}</td>
+                      <td className="px-2.5 py-1.5 min-w-[200px]" style={{ color: b.proceso ? COLOR_PROCESO[b.proceso] : '#94a3b8' }}>{b.actividad || '—'}</td>
+                      <td className="px-2.5 py-1.5 text-slate-600 hidden xl:table-cell">{b.proceso || '—'}</td>
+                      <td className="px-2.5 py-1.5 text-slate-600 hidden lg:table-cell">{b.box || '—'}</td>
                       <td className="px-2.5 py-1.5 text-right text-slate-600 font-medium">{cupos === null ? 'N/A' : cupos}</td>
-                      <td className="px-2.5 py-1.5 text-right text-slate-600">{duracionPorCupo === null ? '—' : `${duracionPorCupo} min`}</td>
+                      <td className="px-2.5 py-1.5 text-right text-slate-600 hidden lg:table-cell">{duracionPorCupo === null ? '—' : `${duracionPorCupo} min`}</td>
                       <td className="px-2.5 py-1.5 text-slate-600">{b.observaciones || '—'}</td>
                       <td className="px-2.5 py-1.5 text-center">{b.esTurno && <span className="text-[10px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full">Turno</span>}</td>
                     </tr>
+                    {filaSubtotal}
+                    </React.Fragment>
                   );
                 }
                 return (
-                  <tr key={b.id} data-fila className="border-t border-slate-100 hover:bg-slate-50/60" style={b.esTurno ? { background: '#FDF6EC' } : undefined}>
+                  <React.Fragment key={b.id}>
+                  <tr data-fila className="border-t border-slate-100 hover:bg-slate-50/60" style={estiloFila}>
                     <td className="px-1 py-1">
-                      <select value={b.dia} onChange={(e) => onEditarFila(b.id, { dia: e.target.value })} className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-full">
-                        {DIAS.map((d) => <option key={d} value={d}>{d}</option>)}
-                      </select>
+                      <div className="flex items-center gap-0.5">
+                        {avisoTope}
+                        <select value={b.dia} onChange={(e) => onEditarFila(b.id, { dia: e.target.value })} className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-full min-w-[84px]">
+                          {(b.esTurno || b.dia === 'Domingo' ? DIAS_TURNO : DIAS).map((d) => <option key={d} value={d}>{d}</option>)}
+                        </select>
+                      </div>
                     </td>
                     <td className="px-1 py-1">
-                      <input
+                      <EditableText
                         type="time"
                         value={hhmmDesdeMin(b.inicioMin)}
-                        onChange={(e) => onEditarFila(b.id, { inicioMin: M(e.target.value) })}
-                        className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-[86px]"
+                        onCommit={(v) => { if (v) onEditarFila(b.id, { inicioMin: M(v) }); }}
+                        className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-[76px]"
                       />
                     </td>
                     <td className="px-1 py-1">
-                      <input
-                        type="time"
-                        value={hhmmDesdeMin(b.inicioMin + b.duracionMin)}
-                        onChange={(e) => onEditarFila(b.id, { duracionMin: Math.max(5, M(e.target.value) - b.inicioMin) })}
-                        className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-[86px]"
-                      />
+                      <div className="flex items-center gap-0.5">
+                        <EditableText
+                          type="time"
+                          value={hhmmDesdeMin((b.inicioMin + b.duracionMin) % 1440)}
+                          onCommit={(v) => {
+                            if (!v) return;
+                            let dur = M(v) - b.inicioMin;
+                            // Un turno puede terminar al día siguiente (ej. 08:00 → 08:00 = 24 h).
+                            if (b.esTurno && dur <= 0) dur += 1440;
+                            onEditarFila(b.id, { duracionMin: Math.max(5, dur) });
+                          }}
+                          className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-[76px]"
+                        />
+                        {b.inicioMin + b.duracionMin >= 1440 && b.inicioMin + b.duracionMin !== 1440 && (
+                          <span className="text-[9px] font-semibold text-[#B6522F]" title="Termina al día siguiente">+1d</span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-1 py-1">
                       <select
@@ -2977,10 +3446,15 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                             rendimiento: item && item.tieneRendimiento ? (sugerido ?? (b.tieneRendimiento ? b.rendimiento : 2)) : 0,
                           });
                         }}
-                        className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-full"
+                        title={b.actividad || ''}
+                        className="text-xs bg-transparent focus:outline-none focus:bg-white rounded px-1 py-1 w-full min-w-[190px]"
                         style={{ color: b.proceso ? COLOR_PROCESO[b.proceso] : '#94a3b8' }}
                       >
-                        {!b.proceso && <option value="">— Selecciona prestación —</option>}
+                        {!b.proceso && <option value="">{b.esTurno ? 'Turno (sin prestación)' : '— Selecciona prestación —'}</option>}
+                        {/* La prestación actual siempre se muestra, aunque el catálogo aún no cargue o no la incluya. */}
+                        {b.proceso && b.actividad && !opciones.some((o) => o.proceso === b.proceso && o.actividad === b.actividad) && (
+                          <option value={`${b.proceso}|||${b.actividad}`}>{b.actividad}</option>
+                        )}
                         {[
                           ...PROCESOS_CAT.filter((p) => opciones.some((o) => o.proceso === p)),
                           ...Array.from(new Set(opciones.map((o) => o.proceso))).filter((p) => !PROCESOS_CAT.includes(p)),
@@ -2993,7 +3467,7 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                         ))}
                       </select>
                     </td>
-                    <td className="px-1 py-1">
+                    <td className="px-1 py-1 hidden xl:table-cell">
                       {(() => {
                         const procesosValidos = Array.from(new Set(opciones.filter((o) => o.actividad === b.actividad).map((o) => o.proceso)));
                         if (!b.actividad || procesosValidos.length === 0) {
@@ -3020,7 +3494,7 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                         );
                       })()}
                     </td>
-                    <td className="px-1 py-1">
+                    <td className="px-1 py-1 hidden lg:table-cell">
                       <EditableText
                         value={b.box || ''}
                         onCommit={(v) => onEditarFila(b.id, { box: v })}
@@ -3044,7 +3518,7 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                         <div className="text-xs text-slate-300 text-right pr-1">N/A</div>
                       )}
                     </td>
-                    <td className="px-2.5 py-1 text-right text-slate-600 font-medium">{duracionPorCupo === null ? '—' : `${duracionPorCupo} min`}</td>
+                    <td className="px-2.5 py-1 text-right text-slate-600 font-medium hidden lg:table-cell">{duracionPorCupo === null ? '—' : `${duracionPorCupo} min`}</td>
                     <td className="px-1 py-1">
                       <EditableText
                         value={b.observaciones || ''}
@@ -3057,8 +3531,12 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                       <input
                         type="checkbox"
                         checked={Boolean(b.esTurno)}
-                        onChange={(e) => onEditarFila(b.id, { esTurno: e.target.checked })}
-                        title="Es un bloque de turno (Art. 15) — no cuenta como horas de jornada"
+                        onChange={(e) => onEditarFila(b.id, e.target.checked
+                          // Al marcar turno se asume un turno de 24 h desde la hora de inicio (editable después).
+                          // y sin prestación: el turno no es una actividad de jornada.
+                          ? { esTurno: true, duracionMin: duracionTurnoServicio(servicio), proceso: null, actividad: null, tieneRendimiento: false, rendimiento: 0 }
+                          : { esTurno: false })}
+                        title={`Es un bloque de turno (Art. 15) — no cuenta como horas de jornada. Al marcarlo se asume ${duracionTurnoServicio(servicio) / 60} h desde la hora de inicio.`}
                       />
                     </td>
                     <td className="text-center">
@@ -3072,6 +3550,8 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
                       </button>
                     </td>
                   </tr>
+                  {filaSubtotal}
+                  </React.Fragment>
                 );
               })}
             </tbody>
@@ -3102,6 +3582,14 @@ function TablaAgendaProfesional({ profesional, especialidad, servicio, bloques, 
           )}
         </div>
       </div>
+      {!soloLectura && (
+        <button
+          onClick={() => onAgregarFila(filas[filas.length - 1] || null, null)}
+          className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-[#4C7C74] border border-dashed border-[#4C7C74]/50 rounded-lg px-3 py-1.5 hover:bg-[#EBF5F2]"
+        >
+          <Plus size={13} /> Agregar fila al final
+        </button>
+      )}
       <div className="text-[11px] text-slate-400 mt-2">
         {filtroActivo ? 'Total horas (filtrado)' : 'Total horas de jornada'}: {totalHrs.toFixed(1)} hrs
         {totalHrsTurno > 0 && <> · Turno: {totalHrsTurno.toFixed(1)} hrs</>}
@@ -3124,11 +3612,7 @@ function ResumenProfesionalPanel({ bloques }) {
   const produccionAnualNeta = produccionAnualBruta * (1 - AUSENTISMO_PCT / 100);
 
   return (
-    <div className="w-72 shrink-0 space-y-4">
-      <div className="bg-white rounded-xl border border-slate-200 p-3">
-        <div className="text-[11px] text-slate-500">Horas programadas</div>
-        <div className="text-xl font-semibold text-slate-800 mt-0.5">{totalHrs.toFixed(1)} hrs</div>
-      </div>
+    <div className="w-full 2xl:w-72 shrink-0 grid gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-1 items-start content-start">
 
       <div>
         <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1.5">Distribución por proceso</div>
@@ -3227,6 +3711,7 @@ function rendimientoPorPrestacion(bloques) {
 
 function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesTodosRaw, proyeccionTurno, servicio }) {
   const [seleccion, setSeleccion] = useState([]); // [{ proceso, actividad }] — se pueden combinar varias prestaciones
+  const [seleccionProfMapa, setSeleccionProfMapa] = useState([]); // claves de profesionales para armar el mapa de calor
   const [filtroBecados, setFiltroBecados] = useState('todos'); // 'todos' | 'sin' | 'solo'
   const [filtroTipoProfesional, setFiltroTipoProfesional] = useState('todos');
   const [filtroProfesional, setFiltroProfesional] = useState('todos');
@@ -3290,10 +3775,17 @@ function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesT
   const horas = horasDesdeBloquesProf(bloques);
   const totalHrs = totalHorasAgenda(horas);
   const porProceso = PROCESOS_CAT.map((p) => ({ proceso: p, horas: horas[p] || 0 }));
-  const porTrazadora = horasPorActividadYProceso(bloques).slice(0, 12);
-  const bloquesDistribucion = seleccion.length > 0
-    ? bloques.filter((b) => seleccion.some((s) => s.proceso === b.proceso && s.actividad === b.actividad))
+  const porTrazadora = horasPorActividadYProceso(bloques);
+  const bloquesPorPrestacion = seleccion.length > 0
+    ? bloques.filter((b) => seleccion.some((s) => s.clave === claveActividad(b.actividad)))
     : bloques;
+  const horasProfMapa = horasPorClaveProfesional(bloquesPorPrestacion, (b) => b.profesionalId);
+  const opcionesProfMapa = profesionales
+    .filter((p) => horasProfMapa.has(p.id) || seleccionProfMapa.includes(p.id))
+    .map((p) => ({ key: p.id, nombre: p.nombre, detalle: p.tipo }));
+  const bloquesDistribucion = seleccionProfMapa.length > 0
+    ? bloquesPorPrestacion.filter((b) => seleccionProfMapa.includes(b.profesionalId))
+    : bloquesPorPrestacion;
   const distribucionAgregada = distribucionDesdeBloquesProf(bloquesDistribucion);
   const paralelosPorBloque = paralelosDesdeBloquesProf(bloquesDistribucion);
   // Cuando lo que se está mirando en el heatmap es específicamente pabellón, se usa la capacidad
@@ -3443,49 +3935,7 @@ function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesT
         </div>
       </div>
 
-      <div>
-        <div className="flex items-center justify-between mb-1 flex-wrap gap-1">
-          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Horas por prestación (top 12)</div>
-          <div className="text-[11px] text-slate-400">Haz clic en una o varias barras para combinarlas en la distribución horaria</div>
-        </div>
-        <div className="flex flex-wrap gap-3 mb-2">
-          {PROCESOS_CAT.map((p) => (
-            <div key={p} className="flex items-center gap-1">
-              <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: COLOR_PROCESO[p] }} />
-              <span className="text-[10px] text-slate-500">{p}</span>
-            </div>
-          ))}
-        </div>
-        <div className="bg-white rounded-xl border border-slate-200 p-3" style={{ height: Math.max(280, porTrazadora.length * 34) }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={porTrazadora} layout="vertical" margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
-              <XAxis type="number" tick={{ fontSize: 9 }} />
-              <YAxis type="category" dataKey="actividad" tick={{ fontSize: 9 }} width={150} interval={0} />
-              <Tooltip formatter={(value, _name, item) => [`${value} hrs`, item.payload.proceso]} />
-              <Bar
-                dataKey="horas"
-                radius={[0, 4, 4, 0]}
-                cursor="pointer"
-                onClick={(data) => setSeleccion((prev) => {
-                  const yaEsta = prev.some((s) => s.proceso === data.proceso && s.actividad === data.actividad);
-                  return yaEsta
-                    ? prev.filter((s) => !(s.proceso === data.proceso && s.actividad === data.actividad))
-                    : [...prev, { proceso: data.proceso, actividad: data.actividad }];
-                })}
-              >
-                {porTrazadora.map((entry) => (
-                  <Cell
-                    key={`${entry.proceso}|||${entry.actividad}`}
-                    fill={seleccion.length === 0 || seleccion.some((s) => s.proceso === entry.proceso && s.actividad === entry.actividad) ? COLOR_PROCESO[entry.proceso] : '#E2E8F0'}
-                  />
-                ))}
-                <LabelList dataKey="horas" position="right" formatter={(v) => (Math.round(v * 10) / 10).toString()} style={{ fontSize: 10, fill: '#475569' }} />
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
+      <GraficoHorasPorPrestacion datos={porTrazadora} seleccion={seleccion} setSeleccion={setSeleccion} />
 
       <div>
         <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
@@ -3500,13 +3950,9 @@ function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesT
                 <span className="text-[10px] font-semibold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">Sin planilla de pabellón cargada — capacidad estimada</span>
               )
             )}
-            {seleccion.length > 0 && (
-              <button onClick={() => setSeleccion([])} className="text-[11px] text-[#4C7C74] hover:underline">
-                Ver todas las prestaciones
-              </button>
-            )}
           </div>
         </div>
+        <SelectorProfesionalesMapa opciones={opcionesProfMapa} horasPorKey={horasProfMapa} seleccion={seleccionProfMapa} setSeleccion={setSeleccionProfMapa} />
         <div className={usarCapacidadRealPabellon ? 'flex flex-wrap gap-6 items-start' : ''}>
           <div>
             {usarCapacidadRealPabellon && <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">Programado</div>}
@@ -3563,7 +4009,7 @@ function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesT
         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
           Detalle por profesional{activarHorasEfectivas ? ' (horas efectivas)' : ''}
         </div>
-        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
@@ -3607,7 +4053,7 @@ function ResumenAgendaTab({ profesionales: profesionalesTodos, bloques: bloquesT
 
       <div>
         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Rendimiento por prestación</div>
-        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
@@ -4036,7 +4482,7 @@ function EditarTurnoDiaDialog({ edicion, servicioId, profesionales, onCancelar, 
   );
 }
 
-function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEditar }) {
+function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEditar, bloquesAgenda, vigenciaDesde, vigenciaHasta }) {
   const [mesInicio, setMesInicio] = useState(() => {
     const primeraFecha = roster?.dias?.[0]?.date;
     if (primeraFecha) {
@@ -4068,7 +4514,27 @@ function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEdit
     cargarMes();
   }, [cargarMes]);
 
-  const datos = datosMes || roster;
+  const datosServidor = datosMes || roster;
+  // Vínculo con la agenda abierta: sus turnos fijos se toman del estado local (no de lo último que
+  // devolvió el servidor), así lo que se agrega/quita en la tabla o en el planificador semanal se
+  // refleja al instante en el calendario, sin esperar a que se guarde y se recargue.
+  const datos = datosServidor && bloquesAgenda ? {
+    ...datosServidor,
+    puestos: Array.from(new Set([...(datosServidor.puestos || []), ...(bloquesAgenda.some((b) => b.esTurno) ? bloquesAgenda.filter((b) => b.esTurno).map((b) => b.actividad || 'Turno') : [])])),
+    dias: (datosServidor.dias || []).map((d) => {
+      const enVigencia = (!vigenciaDesde || d.date >= vigenciaDesde) && (!vigenciaHasta || d.date <= vigenciaHasta);
+      const otros = d.entries.filter((e) => !(e.origen === 'agenda' && e.agendaId === agendaId));
+      if (!enVigencia) return { ...d, entries: otros };
+      const [y, m, dd] = d.date.split('-').map(Number);
+      const diaNombre = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'][new Date(y, m - 1, dd).getDay()];
+      const propios = bloquesAgenda.filter((b) => b.esTurno && b.dia === diaNombre).map((b) => ({
+        unidad: 'Agenda', puesto: b.actividad || 'Turno', startMinutes: b.inicioMin, durationMinutes: b.duracionMin,
+        professionalId: b.profesionalId, professionalName: profesionales.find((p) => p.id === b.profesionalId)?.nombre || 'Profesional',
+        esSustitucion: false, tramoSplit: null, origen: 'agenda', agendaId,
+      }));
+      return { ...d, entries: [...propios, ...otros] };
+    }),
+  } : datosServidor;
   if (!datos) {
     return <div className="text-sm text-slate-400 italic text-center py-10">Cargando turno rotativo…</div>;
   }
@@ -4166,11 +4632,15 @@ function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEdit
                               key={`${puesto}-${ei}`}
                               onClick={() => abrirEdicion(entry)}
                               disabled={!puedeEditar}
-                              title={`${puesto}: ${entry.professionalName} · ${horario}${entry.esSustitucion ? ' (sustitución)' : ''}${puedeEditar ? ' — clic para editar' : ''}`}
+                              title={`${puesto}: ${entry.professionalName} · ${horario}${entry.esSustitucion ? ' (sustitución)' : ''}${entry.origen === 'agenda' ? ' · turno fijo semanal de la agenda (se edita en la agenda del profesional)' : puedeEditar ? ' — clic para editar' : ''}`}
                               className="w-full text-[10px] px-1 py-0.5 rounded truncate text-left hover:opacity-70"
-                              style={{ background: `${PUESTO_COLORES[i % PUESTO_COLORES.length]}1A`, color: PUESTO_COLORES[i % PUESTO_COLORES.length] }}
+                              style={{
+                                background: `${PUESTO_COLORES[i % PUESTO_COLORES.length]}1A`,
+                                color: PUESTO_COLORES[i % PUESTO_COLORES.length],
+                                ...(entry.origen === 'agenda' ? { borderLeft: `2px solid ${PUESTO_COLORES[i % PUESTO_COLORES.length]}` } : {}),
+                              }}
                             >
-                              {primerNombre}{etiquetaTramo}{entry.esSustitucion && ' *'}
+                              {primerNombre}{etiquetaTramo}{entry.esSustitucion && ' *'}{entry.origen === 'agenda' && <span className="opacity-60"> · fijo</span>}
                             </button>
                           );
                         });
@@ -4182,7 +4652,14 @@ function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEdit
             </div>
           ))}
         </div>
-        {puestos.length > 0 && <div className="text-[11px] text-slate-400 mt-1.5">* = sustitución puntual sobre lo que calcula el ciclo.</div>}
+        {puestos.length > 0 && (
+          <div className="text-[11px] text-slate-400 mt-1.5">
+            * = sustitución puntual sobre lo que calcula el ciclo.
+            {datos.puestosFijosAgenda?.length > 0 && (
+              <> · «fijo» = turno semanal cargado en la agenda de cada profesional ({datos.puestosFijosAgenda.join(', ')}); se modifica desde la agenda, no desde las rotaciones.</>
+            )}
+          </div>
+        )}
       </div>
 
       {puedeEditar && (
@@ -4269,7 +4746,7 @@ function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEdit
         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
           Agenda efectiva y horas pendientes por recuperar — {mesInicio.toLocaleDateString('es-CL', { month: 'long', year: 'numeric' })}
         </div>
-        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
@@ -4330,7 +4807,7 @@ function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEdit
 
       <div>
         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Turnos por profesional (últimos 30 días)</div>
-        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
@@ -4357,7 +4834,115 @@ function TurnoRosterTab({ roster, servicioId, agendaId, profesionales, puedeEdit
   );
 }
 
-function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especialidad, servicioId, agendaId, profesionales, bloques, cnePct, atenciones, onEditarCne, onEditarAtenciones, onDescartar, onGuardarBorrador, onCerrar, onEnviar, onAgregarProfesional, onEliminarProfesional, onRenombrarProfesional, onLimpiarProfesional, onAgregarBloque, onEditarBloque, onEliminarBloque }) {
+// Planificador semanal de turnos: muestra los bloques de turno de la agenda organizados por día
+// (no por profesional) y permite agregarlos/quitarlos desde aquí. Cada turno es un bloque de la
+// agenda con esTurno, igual que marcar la casilla Turno en la tabla del profesional.
+const DIAS_TURNO = [...DIAS, 'Domingo'];
+function PlanificadorTurnosSemana({ profesionales, bloques, soloLectura, onAgregarTurno, onEditarBloque, onEliminarBloque }) {
+  const [formDia, setFormDia] = useState(null); // día con el formulario abierto
+  const [profId, setProfId] = useState('');
+  const [inicio, setInicio] = useState('08:00');
+  const [horas, setHoras] = useState(24);
+  const nombrePorId = useMemo(() => Object.fromEntries(profesionales.map((p) => [p.id, p.nombre])), [profesionales]);
+  const turnos = bloques.filter((b) => b.esTurno);
+  const profesionalesOrdenados = useMemo(() => [...profesionales].sort((a, b) => a.nombre.localeCompare(b.nombre, 'es')), [profesionales]);
+
+  function abrir(dia) {
+    setFormDia(dia);
+    setProfId('');
+    setInicio('08:00');
+    setHoras(24);
+  }
+  function confirmar() {
+    if (!profId || !inicio) return;
+    const [h, m] = inicio.split(':').map(Number);
+    onAgregarTurno(profId, formDia, h * 60 + m, Math.max(1, Number(horas) || 24) * 60);
+    setFormDia(null);
+  }
+
+  return (
+    <div className="mb-6">
+      <div className="flex items-end justify-between flex-wrap gap-2 mb-2">
+        <div>
+          <div className="text-sm font-semibold text-slate-800">Turnos semanales de la agenda</div>
+          <div className="text-[11px] text-slate-500">
+            Organizados por día. {soloLectura ? '' : 'Usa «+ Agregar» en cada día para asignar un turno; queda guardado en la agenda del profesional.'}
+          </div>
+        </div>
+        <div className="text-[11px] text-slate-500">{turnos.length} turno{turnos.length === 1 ? '' : 's'} · {fmtHorasTurno(turnos.reduce((s, b) => s + b.duracionMin, 0))}</div>
+      </div>
+      <div className="grid gap-2 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-7">
+        {DIAS_TURNO.map((dia) => {
+          const delDia = turnos.filter((b) => b.dia === dia).sort((a, b) => a.inicioMin - b.inicioMin);
+          return (
+            <div key={dia} className="rounded-xl border border-slate-200 bg-white p-2 flex flex-col min-h-[110px]">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-xs font-semibold text-slate-700">{dia}</span>
+                <span className="text-[10px] text-slate-400">{delDia.length || ''}</span>
+              </div>
+              <div className="space-y-1 flex-1">
+                {delDia.length === 0 && <div className="text-[10px] text-slate-300 italic">Sin turnos</div>}
+                {delDia.map((b) => (
+                  <div key={b.id} className="group rounded-lg bg-[#FBEEE8] px-2 py-1 text-[11px] flex items-start gap-1">
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium text-slate-800 truncate" title={nombrePorId[b.profesionalId]}>{nombrePorId[b.profesionalId] || 'Profesional'}</div>
+                      <div className="text-[10px] text-[#B6522F]">
+                        {hhmmDesdeMin(b.inicioMin)} – {horaFinTexto(b.inicioMin, b.duracionMin)} · {fmtHorasTurno(b.duracionMin)}
+                      </div>
+                    </div>
+                    {!soloLectura && (
+                      <>
+                        <select
+                          value={b.dia}
+                          onChange={(e) => onEditarBloque(b.id, { dia: e.target.value })}
+                          title="Mover a otro día"
+                          className="text-[10px] bg-transparent text-slate-500 w-5 opacity-0 group-hover:opacity-100 focus:opacity-100"
+                        >
+                          {DIAS_TURNO.map((d) => <option key={d} value={d}>{d}</option>)}
+                        </select>
+                        <button onClick={() => onEliminarBloque(b.id)} title="Quitar turno" className="text-slate-400 hover:text-[#B6522F] opacity-0 group-hover:opacity-100">
+                          <X size={12} />
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {!soloLectura && (formDia === dia ? (
+                <div className="mt-2 space-y-1.5 border-t border-slate-100 pt-2">
+                  <select value={profId} onChange={(e) => setProfId(e.target.value)} className="w-full text-[11px] rounded border border-slate-300 px-1 py-1 bg-white">
+                    <option value="">Profesional…</option>
+                    {profesionalesOrdenados.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                  </select>
+                  <div className="flex gap-1">
+                    <input type="time" value={inicio} onChange={(e) => setInicio(e.target.value)} className="flex-1 min-w-0 text-[11px] rounded border border-slate-300 px-1 py-1" title="Hora de inicio" />
+                    <select value={horas} onChange={(e) => setHoras(Number(e.target.value))} className="text-[11px] rounded border border-slate-300 px-1 py-1 bg-white" title="Duración">
+                      {[24, 12, 8, 6, 4].map((h) => <option key={h} value={h}>{h} h</option>)}
+                    </select>
+                  </div>
+                  <div className="flex gap-1.5">
+                    <button onClick={confirmar} disabled={!profId} style={{ background: '#4C7C74' }} className="flex-1 text-[11px] text-white rounded px-2 py-1 disabled:opacity-40">Agregar</button>
+                    <button onClick={() => setFormDia(null)} className="text-[11px] text-slate-500 px-1">Cancelar</button>
+                  </div>
+                </div>
+              ) : (
+                <button onClick={() => abrir(dia)} className="mt-2 text-[11px] text-[#4C7C74] font-medium flex items-center gap-1 hover:underline">
+                  <Plus size={12} /> Agregar
+                </button>
+              ))}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+function fmtHorasTurno(min) {
+  const h = min / 60;
+  return `${Number.isInteger(h) ? h : h.toFixed(1).replace('.', ',')} h`;
+}
+
+function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especialidad, servicioId, agendaId, vigenciaDesde, vigenciaHasta, profesionales, bloques, cnePct, atenciones, onEditarCne, onEditarAtenciones, onDescartar, onGuardarBorrador, onCerrar, onEnviar, onAgregarProfesional, onEliminarProfesional, onRenombrarProfesional, onLimpiarProfesional, onAgregarBloque, onAgregarTurno, onEditarBloque, onEliminarBloque }) {
   const [activoId, setActivoId] = useState(profesionales[0]?.id || null);
   const [dialogo, setDialogo] = useState(null);
   const [soloBecados, setSoloBecados] = useState(false);
@@ -4366,30 +4951,89 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
   useEffect(() => {
     let cancelled = false;
     if (!servicioId) return;
-    fetchShiftRoster(servicioId)
+    // Mes inicial del calendario de turno: el mes actual, salvo que la agenda rija más adelante
+    // (ej. agenda 2027 abierta en noviembre 2026) — ahí se parte en su primer mes de vigencia,
+    // para que se vean los turnos marcados en ESTA agenda y no los de la vigente hoy.
+    let inicio = primerDiaMes(new Date());
+    if (vigenciaDesde) {
+      const [y, m] = String(vigenciaDesde).slice(0, 10).split('-').map(Number);
+      const inicioVigencia = new Date(y, m - 1, 1);
+      if (inicioVigencia > inicio) inicio = inicioVigencia;
+    }
+    const fin = new Date(inicio.getFullYear(), inicio.getMonth() + 1, 0);
+    fetchShiftRoster(servicioId, fechaISO(inicio), fechaISO(fin))
       .then((data) => { if (!cancelled) setRoster(data); })
       .catch(() => { if (!cancelled) setRoster(null); });
     return () => { cancelled = true; };
-  }, [servicioId]);
+  }, [servicioId, vigenciaDesde]);
 
   const puedeEditarTurno = role === 'jefe_servicio' || role === 'admin';
   // Sin esto, un servicio que todavía no tiene ninguna rotación cargada nunca podría mostrar el
   // botón "Nueva rotación" — el jefe de servicio necesita ver la pestaña para poder crear la
   // primera. Un usuario de solo lectura solo la ve si ya hay turno real cargado.
-  const hayRoster = puedeEditarTurno || roster?.dias?.some((d) => d.entries.some((e) => e.professionalName));
+  const hayRoster = puedeEditarTurno
+    || (role === 'referente_programacion' && estado === 'enviada')
+    || bloques.some((b) => b.esTurno)
+    || roster?.dias?.some((d) => d.entries.some((e) => e.professionalName));
   const profesional = profesionales.find((p) => p.id === activoId) || null;
-  const soloLectura = !(role === 'jefe_servicio' && estado === 'borrador');
+  // El referente de programación puede corregir una agenda que el servicio le envió; los cambios
+  // se guardan al instante (no hay "guardar borrador" ni "enviar" en ese modo).
+  const modoCorreccion = role === 'referente_programacion' && estado === 'enviada';
+  // "Guardar borrador" guarda y se queda en la agenda (solo la X cierra).
+  const [estadoGuardado, setEstadoGuardado] = useState(null); // null | 'guardando' | 'guardado'
+  async function guardarSinSalir() {
+    setEstadoGuardado('guardando');
+    try {
+      await onGuardarBorrador(false);
+      setEstadoGuardado('guardado');
+      setTimeout(() => setEstadoGuardado(null), 2500);
+    } catch (_error) {
+      setEstadoGuardado(null);
+    }
+  }
+  const soloLectura = !(role === 'jefe_servicio' && estado === 'borrador') && !modoCorreccion;
   const hayBecados = profesionales.some((p) => p.nivelFormacion);
   const profesionalesListados = soloBecados ? profesionales.filter((p) => p.nivelFormacion) : profesionales;
+  // Topes de horario por profesional (bloques que se superponen el mismo día).
+  const topesAgenda = useMemo(() => detectarTopes(bloques), [bloques]);
+  const topesPorProfesional = useMemo(() => {
+    const m = new Map();
+    bloques.forEach((b) => { if (topesAgenda.has(b.id)) m.set(b.profesionalId, (m.get(b.profesionalId) || 0) + 1); });
+    return m;
+  }, [bloques, topesAgenda]);
+  const primeroConTopes = profesionales.find((p) => topesPorProfesional.has(p.id));
+  function enviarConRevision() {
+    if (topesAgenda.size > 0 && !window.confirm(`Hay ${topesAgenda.size} bloques que se superponen en ${topesPorProfesional.size} profesional(es). ¿Enviar de todas formas?`)) {
+      if (primeroConTopes) setActivoId(primeroConTopes.id);
+      return;
+    }
+    onEnviar();
+  }
 
   return (
     <div className="fixed inset-0 bg-white z-[60] flex flex-col print-reset-ancestor">
-      <div className="border-b border-slate-200 px-5 py-3.5 flex items-center justify-between shrink-0 bg-white no-imprimir">
-        <div>
+      <div className="border-b border-slate-200 px-3 md:px-5 py-3 md:py-3.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 shrink-0 bg-white no-imprimir">
+        <div className="min-w-0">
           <div className="font-semibold text-slate-800">Programación — {titulo}</div>
-          <div className="text-xs text-slate-500">{subtitulo}{soloLectura ? ' · Solo lectura' : ''}</div>
+          <div className="text-xs text-slate-500">
+            {subtitulo}{soloLectura ? ' · Solo lectura' : ''}
+            {topesAgenda.size > 0 && (
+              <button
+                onClick={() => primeroConTopes && setActivoId(primeroConTopes.id)}
+                className="ml-2 inline-flex items-center gap-1 text-[10px] font-semibold text-[#9B2C2C] bg-[#FDECEC] px-2 py-0.5 rounded-full hover:underline"
+                title="Ir al primer profesional con bloques superpuestos"
+              >
+                <AlertTriangle size={11} /> {topesAgenda.size} bloques superpuestos en {topesPorProfesional.size} profesional{topesPorProfesional.size === 1 ? '' : 'es'}
+              </button>
+            )}
+            {modoCorreccion && (
+              <span className="ml-2 inline-block text-[10px] font-semibold text-[#8A5A00] bg-[#FDF3DC] px-2 py-0.5 rounded-full">
+                Corrección del Referente · los cambios se guardan al instante
+              </span>
+            )}
+          </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 ml-auto">
           {activoId === '__resumen__' && (
             <button
               onClick={() => window.print()}
@@ -4404,26 +5048,40 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
               Descartar
             </button>
           )}
-          {!soloLectura && (
-            <button onClick={onEnviar} style={{ background: '#4C7C74' }} className="flex items-center gap-1.5 text-white text-xs font-medium px-3 py-1.5 rounded-lg">
+          {!soloLectura && !modoCorreccion && (
+            <button onClick={enviarConRevision} style={{ background: '#4C7C74' }} className="flex items-center gap-1.5 text-white text-xs font-medium px-3 py-1.5 rounded-lg">
               <Send size={13} /> Enviar a Referente
             </button>
           )}
-          {soloLectura ? (
+          {modoCorreccion ? (
+            <button onClick={onCerrar} style={{ background: '#4C7C74' }} className="text-white text-xs font-medium px-3 py-1.5 rounded-lg">
+              Terminar corrección
+            </button>
+          ) : soloLectura ? (
             <button onClick={onCerrar} className="text-xs text-slate-600 font-medium px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50">
               Cerrar
             </button>
           ) : (
-            <button onClick={onGuardarBorrador} className="text-xs text-slate-600 font-medium px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50">
-              Guardar borrador
+            <button
+              onClick={guardarSinSalir}
+              disabled={estadoGuardado === 'guardando'}
+              className="text-xs text-slate-600 font-medium px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 inline-flex items-center gap-1.5"
+            >
+              {estadoGuardado === 'guardando' && <Loader2 size={12} className="animate-spin" />}
+              {estadoGuardado === 'guardado' && <CheckCircle2 size={12} className="text-[#4C7C74]" />}
+              {estadoGuardado === 'guardado' ? 'Guardado' : 'Guardar borrador'}
             </button>
           )}
-          <button onClick={soloLectura ? onCerrar : onGuardarBorrador} className="text-slate-400 hover:text-slate-700"><X size={20} /></button>
+          <button
+            onClick={soloLectura || modoCorreccion ? onCerrar : () => onGuardarBorrador(true)}
+            className="text-slate-400 hover:text-slate-700"
+            title={soloLectura || modoCorreccion ? 'Cerrar' : 'Guardar y cerrar'}
+          ><X size={20} /></button>
         </div>
       </div>
 
       <div className="flex-1 flex overflow-hidden bg-white print-reset-ancestor">
-        <div className="w-48 shrink-0 border-r border-slate-200 bg-white overflow-y-auto py-2 no-imprimir">
+        <div className="w-36 md:w-48 shrink-0 border-r border-slate-200 bg-white overflow-y-auto py-2 no-imprimir">
           <button
             onClick={() => setActivoId('__resumen__')}
             className={`w-full flex items-center gap-1.5 text-left px-3 py-2 border-l-2 transition-colors ${activoId === '__resumen__' ? 'bg-[#EBF5F2] border-[#4C7C74] text-slate-800 font-semibold' : 'border-transparent text-slate-500 hover:bg-slate-50'}`}
@@ -4463,11 +5121,17 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
                     <span className="ml-1.5 inline-block text-[9px] font-semibold text-[#B6522F] bg-[#FBEEE8] px-1.5 py-0.5 rounded-full align-middle">Turno</span>
                   )}
                 </div>
-                <div className="text-[10px] text-slate-400">{p.tipo || 'Sin tipo'}</div>
+                <div className="text-[10px] text-slate-400">
+                  {p.tipo || 'Sin tipo'}
+                  {p.especialidad && p.especialidad !== especialidad && <span className="text-[#4C7C74]"> · {p.especialidad}</span>}
+                  {topesPorProfesional.has(p.id) && (
+                    <span className="text-[#DC2626] font-semibold"> · {topesPorProfesional.get(p.id)} superpuestos</span>
+                  )}
+                </div>
               </button>
               {!soloLectura && (
                 <button
-                  onClick={() => setDialogo({ tipo: 'editar', profesionalId: p.id, nombreInicial: p.nombre, tipoInicial: p.tipo, nivelFormacionInicial: p.nivelFormacion, tieneTurnoInicial: p.tieneTurno, rutInicial: p.rut })}
+                  onClick={() => setDialogo({ tipo: 'editar', profesionalId: p.id, nombreInicial: p.nombre, tipoInicial: p.tipo, nivelFormacionInicial: p.nivelFormacion, tieneTurnoInicial: p.tieneTurno, rutInicial: p.rut, especialidadInicial: p.especialidad })}
                   className="pr-2 text-slate-400 hover:text-[#4C7C74]"
                   title="Editar"
                 >
@@ -4486,7 +5150,7 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
           )}
         </div>
 
-        <div className="flex-1 overflow-y-auto p-5 bg-white print-reset-ancestor">
+        <div className="flex-1 min-w-0 overflow-y-auto p-3 md:p-5 bg-white print-reset-ancestor">
           {activoId === '__resumen__' ? (
             <div id="resumen-imprimible">
               <div className="hidden print:block mb-4">
@@ -4501,15 +5165,26 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
               />
             </div>
           ) : activoId === '__turno__' ? (
-            <TurnoRosterTab roster={roster} servicioId={servicioId} agendaId={agendaId} profesionales={profesionales} puedeEditar={puedeEditarTurno} />
+            <>
+              <PlanificadorTurnosSemana
+                profesionales={profesionales}
+                bloques={bloques}
+                soloLectura={soloLectura}
+                onAgregarTurno={onAgregarTurno}
+                onEditarBloque={onEditarBloque}
+                onEliminarBloque={onEliminarBloque}
+              />
+              <div className="text-sm font-semibold text-slate-800 mb-2">Calendario mensual</div>
+              <TurnoRosterTab roster={roster} servicioId={servicioId} agendaId={agendaId} profesionales={profesionales} puedeEditar={puedeEditarTurno} bloquesAgenda={bloques} vigenciaDesde={vigenciaDesde} vigenciaHasta={vigenciaHasta} />
+            </>
           ) : !profesional ? (
             <div className="text-sm text-slate-400 italic text-center py-10">Sin profesionales cargados en esta agenda.</div>
           ) : (
-            <div className="flex gap-5 items-start">
+            <div className="flex flex-col 2xl:flex-row gap-5 items-stretch 2xl:items-start">
               <div className="flex-1 min-w-0">
                 <TablaAgendaProfesional
                   profesional={profesional}
-                  especialidad={especialidad}
+                  especialidad={profesional.especialidad || especialidad}
                   servicio={titulo}
                   soloLectura={soloLectura}
                   bloques={bloques.filter((b) => b.profesionalId === profesional.id)}
@@ -4529,9 +5204,10 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
       {dialogo?.tipo === 'agregar' && (
         <ProfesionalDialog
           titulo="Nuevo profesional"
+          especialidadServicio={especialidad}
           onCancelar={() => setDialogo(null)}
-          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut) => {
-            const nuevoId = await onAgregarProfesional(nombre, tipoProf, nivelFormacion, tieneTurno, rut);
+          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut, especialidadProf) => {
+            const nuevoId = await onAgregarProfesional(nombre, tipoProf, nivelFormacion, tieneTurno, rut, especialidadProf);
             setActivoId(nuevoId);
             setDialogo(null);
           }}
@@ -4545,9 +5221,11 @@ function EditorProgramacion({ titulo, subtitulo, estado, role, esNueva, especial
           nivelFormacionInicial={dialogo.nivelFormacionInicial}
           tieneTurnoInicial={dialogo.tieneTurnoInicial}
           rutInicial={dialogo.rutInicial}
+          especialidadInicial={dialogo.especialidadInicial}
+          especialidadServicio={especialidad}
           onCancelar={() => setDialogo(null)}
-          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut) => {
-            await onRenombrarProfesional(dialogo.profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno, rut);
+          onConfirmar={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut, especialidadProf) => {
+            await onRenombrarProfesional(dialogo.profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno, rut, especialidadProf);
             setDialogo(null);
           }}
         />
@@ -4592,7 +5270,8 @@ function AgendaDetail({ agenda, role, onClose, onAction, onGenerarResumen, resum
   const chartTrazadoras = horasPorActividad(agenda.bloquesProf).slice(0, 10);
   const total = totalHorasAgenda(agenda.horas);
   const rendimiento = total > 0 ? (agenda.atenciones / total).toFixed(2) : '0.00';
-  const puedeEditar = agenda.estado === 'borrador' && role === 'jefe_servicio';
+  const puedeEditar = (agenda.estado === 'borrador' && role === 'jefe_servicio')
+    || (agenda.estado === 'enviada' && role === 'referente_programacion');
   const cuposSemanalesAgenda = agenda.bloquesProf.filter((b) => !b.esTurno).reduce((s, b) => s + (b.rendimiento || 0) * (b.duracionMin / 60), 0);
   const produccionAnual = Math.round(cuposSemanalesAgenda * SEMANAS_POR_ANIO * (1 - AUSENTISMO_PCT / 100));
   const [extendiendo, setExtendiendo] = useState(false);
@@ -4685,7 +5364,7 @@ function AgendaDetail({ agenda, role, onClose, onAction, onGenerarResumen, resum
                 <BarChart data={chartTrazadoras} layout="vertical" margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
                   <XAxis type="number" tick={{ fontSize: 9 }} />
-                  <YAxis type="category" dataKey="actividad" tick={{ fontSize: 9 }} width={130} />
+                  <YAxis type="category" dataKey="actividad" tick={{ fontSize: 9 }} width={130} interval={0} />
                   <Tooltip />
                   <Bar dataKey="horas" fill="#7A5CC7" radius={[0, 4, 4, 0]} />
                 </BarChart>
@@ -4760,6 +5439,14 @@ function AgendaDetail({ agenda, role, onClose, onAction, onGenerarResumen, resum
             <div className="bg-white rounded-xl border border-slate-200 p-3 flex items-center justify-between">
               <div className="text-xs text-slate-600">
                 {agenda.profesionales.length} profesional{agenda.profesionales.length === 1 ? '' : 'es'} · {agenda.bloquesProf.length} actividades cargadas
+                {(() => {
+                  const n = detectarTopes(agenda.bloquesProf).size;
+                  return n > 0 ? (
+                    <span className="ml-1.5 inline-flex items-center gap-1 text-[10px] font-semibold text-[#9B2C2C] bg-[#FDECEC] px-1.5 py-0.5 rounded-full align-middle">
+                      <AlertTriangle size={10} /> {n} bloques superpuestos
+                    </span>
+                  ) : null;
+                })()}
               </div>
               <button onClick={onAbrirEditor} className="text-xs font-medium text-[#4C7C74] hover:underline">
                 {puedeEditar ? 'Abrir editor' : 'Ver programación'}
@@ -5048,6 +5735,7 @@ function ResumenDashboardTab({ agendas }) {
   const [filtroTipoProfesional, setFiltroTipoProfesional] = useState('todos');
   const [filtroProfesional, setFiltroProfesional] = useState('todos');
   const [seleccion, setSeleccion] = useState([]); // [{ proceso, actividad }] — se pueden combinar varias prestaciones
+  const [seleccionProfMapa, setSeleccionProfMapa] = useState([]); // claves de profesionales para armar el mapa de calor
   const [capacidadPabellon, setCapacidadPabellon] = useState(null); // { cargado, grid } | null
 
   // La capacidad de pabellón es un concepto por servicio, así que solo se consulta cuando el
@@ -5158,11 +5846,23 @@ function ResumenDashboardTab({ agendas }) {
     return PROCESOS_CAT.map((p) => ({ proceso: p, horas: horasPorProceso[p] || 0 }));
   }, [todosBloques]);
 
-  const porTrazadora = useMemo(() => horasPorActividadYProceso(todosBloques).slice(0, 12), [todosBloques]);
+  const porTrazadora = useMemo(() => horasPorActividadYProceso(todosBloques), [todosBloques]);
 
-  const bloquesDistribucion = useMemo(
-    () => (seleccion.length > 0 ? todosBloques.filter((b) => seleccion.some((s) => s.proceso === b.proceso && s.actividad === b.actividad)) : todosBloques),
+  const bloquesPorPrestacion = useMemo(
+    () => (seleccion.length > 0 ? todosBloques.filter((b) => seleccion.some((s) => s.clave === claveActividad(b.actividad))) : todosBloques),
     [todosBloques, seleccion]
+  );
+  const claveProfMapa = (b) => `${b.__agendaId}|||${b.profesionalId}`;
+  const horasProfMapa = useMemo(() => horasPorClaveProfesional(bloquesPorPrestacion, claveProfMapa), [bloquesPorPrestacion]);
+  const opcionesProfMapa = useMemo(
+    () => profesionalesOpciones
+      .filter((p) => horasProfMapa.has(p.key) || seleccionProfMapa.includes(p.key))
+      .map((p) => ({ key: p.key, nombre: p.nombre, detalle: p.servicio })),
+    [profesionalesOpciones, horasProfMapa, seleccionProfMapa]
+  );
+  const bloquesDistribucion = useMemo(
+    () => (seleccionProfMapa.length > 0 ? bloquesPorPrestacion.filter((b) => seleccionProfMapa.includes(claveProfMapa(b))) : bloquesPorPrestacion),
+    [bloquesPorPrestacion, seleccionProfMapa]
   );
   const distribucionAgregada = useMemo(() => distribucionDesdeBloquesProf(bloquesDistribucion), [bloquesDistribucion]);
   const paralelosPorBloque = useMemo(() => paralelosDesdeBloquesProf(bloquesDistribucion), [bloquesDistribucion]);
@@ -5296,49 +5996,7 @@ function ResumenDashboardTab({ agendas }) {
         </div>
       </div>
 
-      <div>
-        <div className="flex items-center justify-between mb-1 flex-wrap gap-1">
-          <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Horas por prestación (top 12)</div>
-          <div className="text-[11px] text-slate-400">Haz clic en una o varias barras para combinarlas en la distribución horaria</div>
-        </div>
-        <div className="flex flex-wrap gap-3 mb-2">
-          {PROCESOS_CAT.map((p) => (
-            <div key={p} className="flex items-center gap-1">
-              <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: COLOR_PROCESO[p] }} />
-              <span className="text-[10px] text-slate-500">{p}</span>
-            </div>
-          ))}
-        </div>
-        <div className="bg-white rounded-xl border border-slate-200 p-3" style={{ height: Math.max(300, porTrazadora.length * 34) }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={porTrazadora} layout="vertical" margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
-              <XAxis type="number" tick={{ fontSize: 9 }} />
-              <YAxis type="category" dataKey="actividad" tick={{ fontSize: 9 }} width={130} interval={0} />
-              <Tooltip formatter={(value, _name, item) => [`${value} hrs`, item.payload.proceso]} />
-              <Bar
-                dataKey="horas"
-                radius={[0, 4, 4, 0]}
-                cursor="pointer"
-                onClick={(data) => setSeleccion((prev) => {
-                  const yaEsta = prev.some((s) => s.proceso === data.proceso && s.actividad === data.actividad);
-                  return yaEsta
-                    ? prev.filter((s) => !(s.proceso === data.proceso && s.actividad === data.actividad))
-                    : [...prev, { proceso: data.proceso, actividad: data.actividad }];
-                })}
-              >
-                {porTrazadora.map((entry) => (
-                  <Cell
-                    key={`${entry.proceso}|||${entry.actividad}`}
-                    fill={seleccion.length === 0 || seleccion.some((s) => s.proceso === entry.proceso && s.actividad === entry.actividad) ? COLOR_PROCESO[entry.proceso] : '#E2E8F0'}
-                  />
-                ))}
-                <LabelList dataKey="horas" position="right" formatter={(v) => (Math.round(v * 10) / 10).toString()} style={{ fontSize: 10, fill: '#475569' }} />
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
+      <GraficoHorasPorPrestacion datos={porTrazadora} seleccion={seleccion} setSeleccion={setSeleccion} />
 
       <div>
         <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
@@ -5355,13 +6013,9 @@ function ResumenDashboardTab({ agendas }) {
                 <span className="text-[10px] font-semibold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">Sin planilla de pabellón cargada — capacidad estimada</span>
               )
             )}
-            {seleccion.length > 0 && (
-              <button onClick={() => setSeleccion([])} className="text-[11px] text-[#4C7C74] hover:underline">
-                Ver todas las prestaciones
-              </button>
-            )}
           </div>
         </div>
+        <SelectorProfesionalesMapa opciones={opcionesProfMapa} horasPorKey={horasProfMapa} seleccion={seleccionProfMapa} setSeleccion={setSeleccionProfMapa} />
         <div className={usarCapacidadRealPabellon ? 'flex flex-wrap gap-6 items-start' : ''}>
           <div>
             {usarCapacidadRealPabellon && <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">Programado</div>}
@@ -5413,7 +6067,7 @@ function ResumenDashboardTab({ agendas }) {
 
       <div>
         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Rendimiento por prestación</div>
-        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
@@ -5445,7 +6099,7 @@ function ResumenDashboardTab({ agendas }) {
 
       <div>
         <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Detalle</div>
-        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
@@ -5756,7 +6410,7 @@ function RecursosHumanosTab({ resumen, cargando, error, planta, onCambiarPlanta,
         </div>
       )}
 
-      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+      <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
         <table className="w-full text-xs">
           <thead className="bg-slate-50 text-slate-500">
             <tr>
@@ -6352,7 +7006,7 @@ function PabellonPanel({ resumen, cargando, error, onSubirPlanilla }) {
         </div>
       )}
 
-      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+      <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
         <table className="w-full text-xs">
           <thead className="bg-slate-50 text-slate-500">
             <tr>
@@ -6447,6 +7101,22 @@ export default function App() {
   const [authUser, setAuthUser] = useState(null);
   const [services, setServices] = useState(SERVICIOS.map((name) => ({ name, specialtyCatalog: ESPECIALIDAD_POR_SERVICIO[name] || 'No Aplica' })));
   const [agendas, setAgendas] = useState(SEED_AGENDAS);
+  // Periodo de programación activo (año). null = aún no elegido -> se usa el más reciente con
+  // agendas. Toda la plataforma (tablero, resumen, historial, RRHH, pabellón) muestra solo este
+  // periodo, para que la agenda vigente y la del próximo año de un servicio no se sumen.
+  const [periodoElegido, setPeriodoElegido] = useState(null);
+  const periodosDisponibles = useMemo(
+    () => [...new Set(agendas.map((a) => a.periodo).filter(Boolean))].sort((a, b) => b - a),
+    [agendas]
+  );
+  // El próximo año siempre está disponible para empezar a programarlo aunque aún no tenga
+  // agendas, y es el periodo por defecto (proceso de programación del año siguiente).
+  const proximoPeriodo = new Date().getFullYear() + 1;
+  const opcionesPeriodo = useMemo(
+    () => [...new Set([...periodosDisponibles, proximoPeriodo])].sort((a, b) => b - a),
+    [periodosDisponibles, proximoPeriodo]
+  );
+  const periodo = periodoElegido ?? opcionesPeriodo[0];
   const [backendStatus, setBackendStatus] = useState('connecting');
   const [syncLabel, setSyncLabel] = useState('Conectando...');
   const [isHydrated, setIsHydrated] = useState(false);
@@ -6545,8 +7215,13 @@ export default function App() {
     setSyncLabel('Sesión cerrada');
   }
 
+  const agendasDelPeriodo = useMemo(
+    () => agendas.filter((a) => (a.periodo ?? periodo) === periodo),
+    [agendas, periodo]
+  );
+
   const agendasVisibles = useMemo(() => {
-    const confirmadas = agendas.filter((a) => !a.pendienteConfirmar);
+    const confirmadas = agendasDelPeriodo.filter((a) => !a.pendienteConfirmar);
     if (role === 'jefe_servicio') {
       // Un jefe puede tener más de un servicio a cargo (ej. Pediatría y sus subespecialidades
       // comparten un mismo jefe) — el backend ya manda su lista completa en serviceNames.
@@ -6554,7 +7229,7 @@ export default function App() {
       return confirmadas.filter((a) => misServicios.includes(a.servicio));
     }
     return confirmadas; // referente, admisión y subdirección ven todas las agendas confirmadas
-  }, [agendas, role, miServicio, authUser]);
+  }, [agendasDelPeriodo, role, miServicio, authUser]);
 
   const columnas = useMemo(() => {
     const map = {};
@@ -6588,6 +7263,32 @@ export default function App() {
     return refreshed;
   }
 
+  // Ediciones de bloques en cola por agenda: se envían al servidor de a una y en orden, y la
+  // agenda se recarga solo cuando ya no queda ninguna pendiente. Sin esto, varios cambios
+  // seguidos en una fila (día, horas, prestación, turno) disparaban recargas en paralelo y una
+  // respuesta vieja podía llegar al final y "borrar" lo recién escrito.
+  const colaEdicionesRef = useRef({}); // { [agendaId]: { cola: Promise, pendientes: number } }
+  function encolarEdicion(externalId, tarea) {
+    const estado = colaEdicionesRef.current[externalId] || (colaEdicionesRef.current[externalId] = { cola: Promise.resolve(), pendientes: 0 });
+    estado.pendientes += 1;
+    const ejecucion = estado.cola.then(tarea);
+    estado.cola = ejecucion
+      .catch(() => {
+        setSyncLabel('No se pudo guardar un cambio — se recargó la agenda');
+      })
+      .finally(async () => {
+        estado.pendientes -= 1;
+        if (estado.pendientes === 0) {
+          try {
+            const refrescada = await fetchAgenda(externalId);
+            // Si mientras se recargaba entró otro cambio, no se pisa: esa edición recargará al terminar.
+            if (estado.pendientes === 0) replaceAgendaState(refrescada);
+          } catch (_error) { /* se reintenta en la próxima edición */ }
+        }
+      });
+    return estado.cola;
+  }
+
   async function refreshUsersCatalog() {
     if (!authUser || authUser.role !== 'admin') return;
     const users = await fetchUsers();
@@ -6611,7 +7312,7 @@ export default function App() {
     setCargandoRrhh(true);
     setErrorRrhh('');
     try {
-      const data = await fetchHrSummary({ planta: planta || plantaRrhh });
+      const data = await fetchHrSummary({ planta: planta || plantaRrhh, periodo });
       setResumenRrhh(data);
     } catch (err) {
       setErrorRrhh(err.message || 'No se pudo cargar el resumen de RRHH.');
@@ -6629,14 +7330,14 @@ export default function App() {
   useEffect(() => {
     if (tab === 'rrhh') refreshHrSummary(plantaRrhh);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, plantaRrhh]);
+  }, [tab, plantaRrhh, periodo]);
 
   async function refreshPabellonSummary() {
     if (!authUser || !HR_ROLES.includes(authUser.role)) return;
     setCargandoPabellon(true);
     setErrorPabellon('');
     try {
-      const data = await fetchPabellonSummary();
+      const data = await fetchPabellonSummary({ periodo });
       setResumenPabellon(data);
     } catch (err) {
       setErrorPabellon(err.message || 'No se pudo cargar la planificación de pabellón.');
@@ -6654,7 +7355,7 @@ export default function App() {
   useEffect(() => {
     if (tab === 'infraestructura') refreshPabellonSummary();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab]);
+  }, [tab, periodo]);
 
   async function refreshNotifications() {
     try {
@@ -6721,6 +7422,7 @@ export default function App() {
         nivelFormacion: payload.nivelFormacion || null,
         tieneTurno: payload.tieneTurno || false,
         rut: payload.rut || null,
+        especialidad: payload.especialidad || null,
       });
       await refreshAgendaState(agenda.id);
       return newId;
@@ -6731,6 +7433,8 @@ export default function App() {
       return;
     }
     if (action === 'confirmar_creacion') {
+      // Antes de confirmar, se espera a que terminen de guardarse los cambios en cola.
+      await colaEdicionesRef.current[agenda.id]?.cola;
       const updated = await confirmDraft(agenda.id);
       replaceAgendaState(updated);
       return;
@@ -6742,6 +7446,7 @@ export default function App() {
         nivelFormacion: payload.nivelFormacion,
         tieneTurno: payload.tieneTurno,
         rut: payload.rut ?? null,
+        especialidad: payload.especialidad ?? null,
       });
       await refreshAgendaState(agenda.id);
       return;
@@ -6753,8 +7458,19 @@ export default function App() {
       return;
     }
     if (action === 'agregar_bloque_prof') {
-      await createBlock(agenda.id, {
-        id: nuevoBloqueId(),
+      // La fila aparece al instante; el guardado en el servidor va en segundo plano (cola).
+      const idNuevo = nuevoBloqueId();
+      updateAgenda(agenda.id, (a) => {
+        a.bloquesProf = [...a.bloquesProf, {
+          id: idNuevo, profesionalId: payload.profesionalId, dia: payload.dia, inicioMin: payload.inicioMin, duracionMin: payload.duracionMin,
+          proceso: payload.proceso ?? null, actividad: payload.actividad ?? null, clinica: payload.clinica ?? true,
+          tieneRendimiento: payload.tieneRendimiento ?? true, rendimiento: payload.rendimiento ?? 0, box: payload.box ?? null,
+          observaciones: payload.observaciones ?? '', esTurno: payload.esTurno ?? false,
+        }];
+        return a;
+      });
+      encolarEdicion(agenda.id, () => createBlock(agenda.id, {
+        id: idNuevo,
         profesionalId: payload.profesionalId,
         dia: payload.dia,
         inicioMin: payload.inicioMin,
@@ -6767,28 +7483,29 @@ export default function App() {
         box: payload.box ?? null,
         observaciones: payload.observaciones ?? '',
         esTurno: payload.esTurno ?? false,
-      });
-      await refreshAgendaState(agenda.id);
+      }));
       return;
     }
     if (action === 'editar_bloque_prof') {
       // Actualiza el estado local de inmediato (antes de esperar la red) para que columnas derivadas
       // como Duración reflejen el cambio al instante, en vez de esperar el viaje completo al servidor.
       updateAgenda(agenda.id, (a) => {
-        a.bloquesProf = a.bloquesProf.map((b) => (b.id === payload.bloqueId ? { ...b, ...payload.cambios } : b));
+        // Asignar una actividad a un bloque de turno lo convierte en jornada (misma regla que el servidor).
+        const pasaAJornada = payload.cambios.actividad && payload.cambios.esTurno === undefined;
+        a.bloquesProf = a.bloquesProf.map((b) => (b.id === payload.bloqueId ? { ...b, ...payload.cambios, ...(pasaAJornada ? { esTurno: false } : {}) } : b));
         return a;
       });
-      await updateBlock(agenda.id, payload.bloqueId, payload.cambios);
-      await refreshAgendaState(agenda.id);
+      encolarEdicion(agenda.id, () => updateBlock(agenda.id, payload.bloqueId, payload.cambios));
       return;
     }
     if (action === 'eliminar_bloque_prof') {
-      await deleteBlock(agenda.id, payload.bloqueId);
-      await refreshAgendaState(agenda.id);
+      updateAgenda(agenda.id, (a) => { a.bloquesProf = a.bloquesProf.filter((b) => b.id !== payload.bloqueId); return a; });
+      encolarEdicion(agenda.id, () => deleteBlock(agenda.id, payload.bloqueId));
       return;
     }
     if (action === 'enviar' || action === 'reenviar') {
       try {
+        await colaEdicionesRef.current[agenda.id]?.cola;
         const updated = await transitionAgenda(agenda.id, 'enviada');
         replaceAgendaState(updated);
         setSelected(null);
@@ -6881,12 +7598,12 @@ export default function App() {
 
   return (
     <div className="w-full h-screen bg-[#F4F2ED] flex flex-col font-sans text-slate-800 overflow-hidden print-reset-ancestor">
-      <div className="bg-[#1E2E33] px-5 py-3 flex items-center justify-between shrink-0 no-imprimir">
-        <div>
+      <div className="bg-[#1E2E33] px-3 md:px-5 py-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 shrink-0 no-imprimir">
+        <div className="min-w-0">
           <div className="text-white font-semibold text-sm tracking-tight">Seguimiento de Agendas Institucionales</div>
           <div className="text-[#9FB0B5] text-[11px] font-mono">DDI · Hospital San Juan de Dios de La Serena</div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3 ml-auto">
           <div className={`hidden md:inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-medium border ${
             backendStatus === 'online'
               ? 'bg-[#29453C] text-[#D6F5E7] border-[#4C7C74]'
@@ -6896,6 +7613,22 @@ export default function App() {
           }`}>
             {syncLabel}
           </div>
+          {authUser && (
+            <label className="flex items-center gap-1.5 text-[11px] text-[#9FB0B5]">
+              <span className="hidden sm:inline">Periodo</span>
+              <select
+                value={periodo}
+                onChange={(e) => setPeriodoElegido(Number(e.target.value))}
+                style={{ background: '#2A3E44', border: '1px solid #3E545B' }}
+                className="text-white text-xs font-semibold rounded-lg px-2 py-1.5"
+                title="Periodo de programación que se muestra en toda la plataforma"
+              >
+                {opcionesPeriodo.map((p) => (
+                  <option key={p} value={p}>{p}{periodosDisponibles.includes(p) ? '' : ' (sin agendas)'}</option>
+                ))}
+              </select>
+            </label>
+          )}
           <div className="relative">
             <button onClick={() => setShowNotifs((s) => !s)} className="relative text-[#CBD5D9] hover:text-white p-1.5">
               <Bell size={18} />
@@ -6959,7 +7692,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className="flex gap-1 px-5 pt-3 shrink-0 no-imprimir">
+      <div className="flex gap-1 px-3 md:px-5 pt-3 shrink-0 no-imprimir overflow-x-auto">
         {[
           { id: 'tablero', label: 'Tablero', icon: LayoutGrid },
           { id: 'resumen', label: 'Resumen de Horas', icon: BarChart3 },
@@ -6974,7 +7707,7 @@ export default function App() {
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
-            className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-t-lg ${tab === t.id ? 'bg-white text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}
+            className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-t-lg whitespace-nowrap shrink-0 ${tab === t.id ? 'bg-white text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}
           >
             <t.icon size={13} /> {t.label}
           </button>
@@ -6982,6 +7715,18 @@ export default function App() {
       </div>
 
       <div className="flex-1 bg-white overflow-hidden no-imprimir">
+        {isHydrated && authUser && agendasDelPeriodo.length === 0 && (
+          <div className="mx-5 mt-4 rounded-xl border border-[#4C7C74]/30 bg-[#EBF5F2] px-4 py-3 text-xs text-[#2F6C5D] flex items-center justify-between gap-3 flex-wrap">
+            <span>
+              Aún no hay agendas cargadas para el periodo <b>{periodo}</b>. Puedes crear una con «Nueva agenda» (partiendo de la última versión del servicio) o cargarlas desde Excel.
+            </span>
+            {periodosDisponibles.length > 0 && (
+              <button onClick={() => setPeriodoElegido(periodosDisponibles[0])} className="font-medium underline">
+                Ver periodo {periodosDisponibles[0]}
+              </button>
+            )}
+          </div>
+        )}
         {tab === 'tablero' && (
           <div className="h-full overflow-x-auto p-4">
             <div className="flex gap-3 h-full min-w-max">
@@ -7037,7 +7782,7 @@ export default function App() {
           />
         )}
         {tab === 'cargar-agenda' && IMPORT_AGENDA_ROLES.includes(role) && (
-          <CargarAgendaTab agendas={agendas} />
+          <CargarAgendaTab agendas={agendasDelPeriodo} />
         )}
         {tab === 'docs' && <DocsTab />}
         {tab === 'chat' && <ChatIA />}
@@ -7061,7 +7806,7 @@ export default function App() {
           agendaBase={agendaBaseParaNuevo}
           onClose={() => setShowNuevo(false)}
           onCreate={async (servicio, jefe, horas, mes, cnePct, atenciones, distribucion, profesionales, bloquesProf, vigenciaDesde, vigenciaHasta) => {
-            const nueva = makeAgenda(servicio, jefe, horas, mes, cnePct, atenciones, distribucion, profesionales, bloquesProf, true, vigenciaDesde, vigenciaHasta);
+            const nueva = { ...makeAgenda(servicio, jefe, horas, mes, cnePct, atenciones, distribucion, profesionales, bloquesProf, true, vigenciaDesde, vigenciaHasta), periodo };
             try {
               const creada = await createAgenda(nueva);
               setAgendas((a) => [...a.filter((item) => item.id !== creada.id), creada]);
@@ -7086,15 +7831,17 @@ export default function App() {
           especialidad={services.find((s) => s.name === agendaEnEditor.servicio)?.specialtyCatalog || 'No Aplica'}
           servicioId={agendaEnEditor.servicioId}
           agendaId={agendaEnEditor.id}
+          vigenciaDesde={agendaEnEditor.vigenciaDesde}
+          vigenciaHasta={agendaEnEditor.vigenciaHasta}
           profesionales={agendaEnEditor.profesionales}
           bloques={agendaEnEditor.bloquesProf}
           cnePct={agendaEnEditor.cnePct}
           atenciones={agendaEnEditor.atenciones}
           onEditarCne={(valor) => handleAction('editar_cne', agendaEnEditor, { valor })}
           onEditarAtenciones={(valor) => handleAction('editar_atenciones', agendaEnEditor, { valor })}
-          onGuardarBorrador={async () => {
+          onGuardarBorrador={async (cerrar = false) => {
             await handleAction('confirmar_creacion', agendaEnEditor, {});
-            setShowEditorFor(null);
+            if (cerrar) setShowEditorFor(null);
           }}
           onCerrar={() => setShowEditorFor(null)}
           onDescartar={async () => {
@@ -7110,12 +7857,12 @@ export default function App() {
             await handleAction('enviar', agendaEnEditor);
             setShowEditorFor(null);
           }}
-          onAgregarProfesional={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut) => {
+          onAgregarProfesional={async (nombre, tipoProf, nivelFormacion, tieneTurno, rut, especialidadProf) => {
             const nuevoId = nuevoProfesionalId();
-            return handleAction('agregar_profesional', agendaEnEditor, { nombre, tipo: tipoProf, nivelFormacion, tieneTurno, rut, idPrefijado: nuevoId });
+            return handleAction('agregar_profesional', agendaEnEditor, { nombre, tipo: tipoProf, nivelFormacion, tieneTurno, rut, especialidad: especialidadProf, idPrefijado: nuevoId });
           }}
           onEliminarProfesional={async (profesionalId) => handleAction('quitar_profesional', agendaEnEditor, { profesionalId })}
-          onRenombrarProfesional={async (profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno, rut) => handleAction('renombrar_profesional', agendaEnEditor, { profesionalId, nombre, tipo: tipoProf, nivelFormacion, tieneTurno, rut })}
+          onRenombrarProfesional={async (profesionalId, nombre, tipoProf, nivelFormacion, tieneTurno, rut, especialidadProf) => handleAction('renombrar_profesional', agendaEnEditor, { profesionalId, nombre, tipo: tipoProf, nivelFormacion, tieneTurno, rut, especialidad: especialidadProf })}
           onLimpiarProfesional={async (profesionalId) => handleAction('limpiar_bloques_profesional', agendaEnEditor, { profesionalId })}
           onAgregarBloque={(profesionalId, anterior, siguiente) => {
             const valores = calcularInsercion(anterior, siguiente);
@@ -7123,6 +7870,9 @@ export default function App() {
           }}
           onEditarBloque={(bloqueId, cambios) => handleAction('editar_bloque_prof', agendaEnEditor, { bloqueId, cambios })}
           onEliminarBloque={(bloqueId) => handleAction('eliminar_bloque_prof', agendaEnEditor, { bloqueId })}
+          onAgregarTurno={(profesionalId, dia, inicioMin, duracionMin) => handleAction('agregar_bloque_prof', agendaEnEditor, {
+            profesionalId, dia, inicioMin, duracionMin, esTurno: true, tieneRendimiento: false, rendimiento: 0,
+          })}
         />
       )}
       {pendingReject && (

@@ -292,8 +292,8 @@ export async function uploadPabellonPlan(file) {
   return response.json();
 }
 
-export async function fetchPabellonSummary() {
-  return request('/pabellon/summary');
+export async function fetchPabellonSummary(params) {
+  return request(`/pabellon/summary${buildQuery(params)}`);
 }
 
 export async function fetchPabellonCapacidad(servicio) {

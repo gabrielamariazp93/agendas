@@ -11,3 +11,4 @@ prisma/.DS_Store
 coverage
 .vite
 user.txr
+backups/

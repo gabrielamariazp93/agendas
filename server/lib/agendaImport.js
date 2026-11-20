@@ -60,8 +60,30 @@ function colIndexFor(headerRow, baseCol, ...keywords) {
   return null;
 }
 
+// Algunas hojas reales traen el bloque RUT/NOMBRE/ESPECIALIDAD y la grilla de horario pero se
+// les borró la fila de encabezado DIA/DESDE/HASTA/... (ej. Dra. Motrán, Gine-Obstetricia 2027).
+// Si bajo el rótulo 'RUT' aparecen filas que parten con un día de la semana en esa misma columna,
+// se asume el orden estándar de la plantilla: DIA, DESDE, HASTA, ∆, ACTIVIDAD, BOX, CUPOS.
+const COLUMNAS_PLANTILLA = ['DIA', 'DESDE', 'HASTA', '∆', 'ACTIVIDAD', 'BOX', 'CUPOS'];
+function findHeaderlessGrid(rows, maxScanRows = 12) {
+  for (let r = 0; r < Math.min(rows.length, maxScanRows); r++) {
+    const row = rows[r] || [];
+    for (let c = 0; c < row.length; c++) {
+      if (normalizeText(row[c]) !== 'RUT') continue;
+      for (let d = r + 1; d < Math.min(rows.length, r + 12); d++) {
+        if (DIAS_VALIDAS.has(normalizeText((rows[d] || [])[c]))) {
+          const virtualHeader = [];
+          COLUMNAS_PLANTILLA.forEach((label, i) => { virtualHeader[c + i] = label; });
+          return { row: d - 1, col: c, virtualHeader };
+        }
+      }
+    }
+  }
+  return null;
+}
+
 function parseSheet(sheetName, rows) {
-  const header = findHeader(rows);
+  const header = findHeader(rows) || findHeaderlessGrid(rows);
   if (!header) {
     return { sheet: sheetName, omitida: true, motivo: 'Sin fila de encabezado "DIA" — no es una hoja de horario.' };
   }
@@ -87,7 +109,7 @@ function parseSheet(sheetName, rows) {
     }
   }
 
-  const headerRowValues = rows[headerRow] || [];
+  const headerRowValues = header.virtualHeader || rows[headerRow] || [];
   const idxDesde = colIndexFor(headerRowValues, diaCol, 'DESDE');
   const idxHasta = colIndexFor(headerRowValues, diaCol, 'HASTA');
   const idxActividad = colIndexFor(headerRowValues, diaCol, 'ACTIVIDAD');
@@ -154,12 +176,20 @@ function parseSheet(sheetName, rows) {
 // de la grilla DIA/DESDE/HASTA/ACTIVIDAD/BOX/CUPOS). Hojas sin ese formato (resúmenes, catálogos,
 // plantillas en blanco) se omiten automáticamente al no encontrar la fila 'DIA'.
 export function parseAgendaWorkbook(buffer) {
-  const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  // cellDates: false a propósito — las horas (DESDE/HASTA) se leen como fracción de día (número
+  // serial de Excel, ver toMinutes). Con cellDates: true la librería las convierte en fechas de
+  // 1899, y en zona horaria de Chile ese año usaba hora media local (UTC−4:42:46): al leerlas en
+  // UTC todos los horarios quedaban corridos +4h42 (08:00 -> 12:42).
+  const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: false });
   const resultados = [];
   const omitidas = [];
 
   for (const sheetName of workbook.SheetNames) {
-    if (HOJAS_EXCLUIDAS.has(normalizeText(sheetName)) || /^\d+$/.test(sheetName.trim())) {
+    // Las hojas con nombre solo numérico suelen ser plantillas, pero algunas planillas (ej. MFyR
+    // 2027) numeran así las hojas de cada profesional: esas se leen igual y se aceptan solo si
+    // traen nombre y bloques reales (más abajo).
+    const hojaNumerica = /^\d+$/.test(sheetName.trim());
+    if (HOJAS_EXCLUIDAS.has(normalizeText(sheetName))) {
       omitidas.push({ sheet: sheetName, motivo: 'Pestaña de referencia/plantilla conocida — no es un horario.' });
       continue;
     }
@@ -168,6 +198,10 @@ export function parseAgendaWorkbook(buffer) {
     const parsed = parseSheet(sheetName, rows);
     if (parsed.omitida) {
       omitidas.push({ sheet: sheetName, motivo: parsed.motivo });
+      continue;
+    }
+    if (hojaNumerica && (!parsed.nombre || parsed.nombre === sheetName.trim())) {
+      omitidas.push({ sheet: sheetName, motivo: 'Pestaña de referencia/plantilla conocida — no es un horario.' });
       continue;
     }
     if (parsed.bloques.length === 0) {

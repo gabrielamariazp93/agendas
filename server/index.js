@@ -378,7 +378,11 @@ function canViewAgenda(user, agenda) {
 }
 
 function canEditAgenda(user, agenda) {
-  return user.role === 'admin' || (user.role === 'jefe_servicio' && !!user.serviceIds?.includes(agenda.serviceId) && ['borrador', 'rechazada'].includes(agenda.status));
+  return user.role === 'admin'
+    || (user.role === 'jefe_servicio' && !!user.serviceIds?.includes(agenda.serviceId) && ['borrador', 'rechazada'].includes(agenda.status))
+    // El referente de programación puede corregir directamente una agenda que el servicio le
+    // envió (antes de aprobarla o rechazarla). Cada cambio queda en AgendaAudit con su usuario.
+    || (user.role === 'referente_programacion' && agenda.status === 'enviada');
 }
 
 async function createAudit(tx, agendaId, actorUser, action, entityType, entityId, payload) {
@@ -479,11 +483,17 @@ async function checkVigenciaAlerts() {
   }
 }
 
-async function resolveCatalogActivityForBlock(tx, agenda, profession, blockInput) {
+// Especialidad efectiva de un profesional: la suya propia si la tiene (agendas que agrupan varias
+// especialidades, ej. CESAM adulto + infanto-juvenil), si no la del servicio de la agenda.
+function effectiveSpecialty(agenda, professional) {
+  return professional?.specialtyCatalog || agenda?.serviceSpecialty || null;
+}
+
+async function resolveCatalogActivityForBlock(tx, specialty, profession, blockInput) {
   const process = blockInput.process ?? blockInput.proceso ?? null;
   const activity = blockInput.activity ?? blockInput.actividad ?? null;
   if (!process || !activity) return null;
-  const specialties = agenda.serviceSpecialty ? [agenda.serviceSpecialty, 'No Aplica'] : ['No Aplica'];
+  const specialties = specialty ? [specialty, 'No Aplica'] : ['No Aplica'];
   const rows = await tx.catalogActivity.findMany({
     where: {
       process,
@@ -494,18 +504,18 @@ async function resolveCatalogActivityForBlock(tx, agenda, profession, blockInput
   });
 
   rows.sort((a, b) => {
-    const aScore = a.specialty === agenda.serviceSpecialty ? 0 : 1;
-    const bScore = b.specialty === agenda.serviceSpecialty ? 0 : 1;
+    const aScore = a.specialty === specialty ? 0 : 1;
+    const bScore = b.specialty === specialty ? 0 : 1;
     return aScore - bScore;
   });
 
   return rows[0] ?? null;
 }
 
-async function resolveSuggestedPerformance(tx, agenda, blockInput) {
+async function resolveSuggestedPerformance(tx, specialty, blockInput) {
   const process = blockInput.process ?? blockInput.proceso ?? null;
   const activity = blockInput.activity ?? blockInput.actividad ?? null;
-  if (!activity || !process || !agenda.serviceSpecialty) {
+  if (!activity || !process || !specialty) {
     return { suggestedPerformance: null, performanceSource: null };
   }
   const row = await tx.referencePerformance.findUnique({
@@ -513,7 +523,7 @@ async function resolveSuggestedPerformance(tx, agenda, blockInput) {
       process_activity_specialty: {
         process,
         activity,
-        specialty: agenda.serviceSpecialty,
+        specialty,
       },
     },
   });
@@ -884,8 +894,18 @@ app.get('/api/hr/personas', async (req, res) => {
   res.json({ items });
 });
 
+// Periodo de programación pedido (?periodo=2027). Sin parámetro se usa el periodo más reciente
+// con agendas cargadas, para que los cruces nunca sumen dos periodos a la vez.
+async function resolvePeriodo(req) {
+  const n = Number(req.query?.periodo);
+  if (Number.isInteger(n) && n > 2000) return n;
+  const agg = await prisma.agenda.aggregate({ _max: { planningPeriod: true } });
+  return agg._max.planningPeriod ?? new Date().getFullYear();
+}
+
 app.get('/api/hr/summary', async (req, res) => {
   if (!requireRoles(req, res, HR_ROLES)) return;
+  const periodo = await resolvePeriodo(req);
 
   const planta = typeof req.query.planta === 'string' && req.query.planta.trim()
     ? req.query.planta.trim().toUpperCase()
@@ -917,6 +937,7 @@ app.get('/api/hr/summary', async (req, res) => {
   // programadas (excluye turno) y en qué agenda(s) aparecen — se cruza en memoria porque el
   // universo de profesionales es chico (unos cientos), no miles.
   const professionals = await prisma.agendaProfessional.findMany({
+    where: { agenda: { planningPeriod: periodo } },
     select: {
       id: true, name: true, rut: true,
       agenda: { select: { serviceName: true } },
@@ -1001,6 +1022,7 @@ app.post('/api/pabellon/import', hrUpload.single('file'), async (req, res) => {
 
 app.get('/api/pabellon/summary', async (req, res) => {
   if (!requireRoles(req, res, HR_ROLES)) return;
+  const periodo = await resolvePeriodo(req);
 
   const [allocations, services, lastImport] = await Promise.all([
     prisma.pabellonAllocation.findMany(),
@@ -1056,7 +1078,7 @@ app.get('/api/pabellon/summary', async (req, res) => {
           where: {
             isShift: false,
             activity: { contains: 'Pabellon', mode: 'insensitive' },
-            agenda: { serviceId },
+            agenda: { serviceId, planningPeriod: periodo },
           },
           select: { day: true, startMinutes: true, durationMinutes: true, activity: true },
         }).then((rows) => rows.filter((b) => DIAS_SEMANA.includes(b.day)))
@@ -1335,7 +1357,7 @@ app.put('/api/agendas/:externalId', async (req, res) => {
 // Existe porque estos 3 campos se editaban SOLO en el estado local de React sin ningún llamado a
 // la API — se veían guardados en la pantalla pero se perdían apenas se recargaba la página.
 app.patch('/api/agendas/:externalId/fields', async (req, res) => {
-  if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
+  if (!requireRoles(req, res, ['jefe_servicio', 'admin', 'referente_programacion'])) return;
 
   const existing = await loadAgendaOr404(req.params.externalId, res);
   if (!existing) return;
@@ -1753,12 +1775,19 @@ app.get('/api/agendas/:externalId/professionals', async (req, res) => {
         nombre: professional.name,
         tipo: professional.type,
         nivelFormacion: professional.trainingLevel,
+        especialidad: professional.specialtyCatalog ?? null,
       }))
   );
 });
 
+// '' o null en el body = volver a la especialidad del servicio; undefined = no tocar.
+function parseEspecialidadInput(value) {
+  if (value === undefined) return undefined;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
 app.post('/api/agendas/:externalId/professionals', async (req, res) => {
-  if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
+  if (!requireRoles(req, res, ['jefe_servicio', 'admin', 'referente_programacion'])) return;
   const agenda = await loadAgendaOr404(req.params.externalId, res);
   if (!agenda) return;
   if (!canEditAgenda(req.authUser, agenda)) {
@@ -1786,6 +1815,7 @@ app.post('/api/agendas/:externalId/professionals', async (req, res) => {
         hasTurno: Boolean(req.body?.tieneTurno ?? false),
         isShiftOnly: Boolean(req.body?.esSoloTurno ?? false),
         rut: normalizeRut(req.body?.rut) || null,
+        specialtyCatalog: parseEspecialidadInput(req.body?.especialidad) ?? null,
         sortOrder: currentCount,
       },
     });
@@ -1802,11 +1832,12 @@ app.post('/api/agendas/:externalId/professionals', async (req, res) => {
     tieneTurno: created.hasTurno,
     esSoloTurno: created.isShiftOnly,
     rut: created.rut,
+    especialidad: created.specialtyCatalog ?? null,
   });
 });
 
 app.put('/api/agendas/:externalId/professionals/:professionalId', async (req, res) => {
-  if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
+  if (!requireRoles(req, res, ['jefe_servicio', 'admin', 'referente_programacion'])) return;
   const agenda = await loadAgendaOr404(req.params.externalId, res);
   if (!agenda) return;
   if (!canEditAgenda(req.authUser, agenda)) {
@@ -1827,6 +1858,9 @@ app.put('/api/agendas/:externalId/professionals/:professionalId', async (req, re
         hasTurno: req.body?.tieneTurno !== undefined ? Boolean(req.body.tieneTurno) : professional.hasTurno,
         isShiftOnly: req.body?.esSoloTurno !== undefined ? Boolean(req.body.esSoloTurno) : professional.isShiftOnly,
         rut: req.body?.rut !== undefined ? (normalizeRut(req.body.rut) || null) : professional.rut,
+        specialtyCatalog: parseEspecialidadInput(req.body?.especialidad) !== undefined
+          ? parseEspecialidadInput(req.body.especialidad)
+          : professional.specialtyCatalog,
       },
     });
     await createAudit(tx, agenda.id, req.authUser, 'update', 'professional', professional.externalId || professional.id, req.body);
@@ -1842,11 +1876,12 @@ app.put('/api/agendas/:externalId/professionals/:professionalId', async (req, re
     tieneTurno: updated.hasTurno,
     esSoloTurno: updated.isShiftOnly,
     rut: updated.rut,
+    especialidad: updated.specialtyCatalog ?? null,
   });
 });
 
 app.delete('/api/agendas/:externalId/professionals/:professionalId', async (req, res) => {
-  if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
+  if (!requireRoles(req, res, ['jefe_servicio', 'admin', 'referente_programacion'])) return;
   const agenda = await loadAgendaOr404(req.params.externalId, res);
   if (!agenda) return;
   if (!canEditAgenda(req.authUser, agenda)) {
@@ -1894,7 +1929,7 @@ app.get('/api/agendas/:externalId/blocks', async (req, res) => {
 });
 
 app.post('/api/agendas/:externalId/blocks', async (req, res) => {
-  if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
+  if (!requireRoles(req, res, ['jefe_servicio', 'admin', 'referente_programacion'])) return;
   const agenda = await loadAgendaOr404(req.params.externalId, res);
   if (!agenda) return;
   if (!canEditAgenda(req.authUser, agenda)) {
@@ -1915,11 +1950,12 @@ app.post('/api/agendas/:externalId/blocks', async (req, res) => {
 
   const block = await prisma.$transaction(async (tx) => {
     const freshAgenda = await tx.agenda.findUnique({ where: { id: agenda.id } });
-    const catalogActivity = await resolveCatalogActivityForBlock(tx, freshAgenda, professional.type, req.body);
+    const specialty = effectiveSpecialty(freshAgenda, professional);
+    const catalogActivity = await resolveCatalogActivityForBlock(tx, specialty, professional.type, req.body);
     if (req.body?.activity && !catalogActivity) {
       throw new Error('ACTIVITY_NOT_ALLOWED');
     }
-    const perf = await resolveSuggestedPerformance(tx, freshAgenda, req.body);
+    const perf = await resolveSuggestedPerformance(tx, specialty, req.body);
     const created = await tx.agendaBlock.create({
       data: {
         agendaId: agenda.id,
@@ -1972,7 +2008,7 @@ app.post('/api/agendas/:externalId/blocks', async (req, res) => {
 });
 
 app.put('/api/agendas/:externalId/blocks/:blockId', async (req, res) => {
-  if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
+  if (!requireRoles(req, res, ['jefe_servicio', 'admin', 'referente_programacion'])) return;
   const agenda = await loadAgendaOr404(req.params.externalId, res);
   if (!agenda) return;
   if (!canEditAgenda(req.authUser, agenda)) {
@@ -1981,26 +2017,35 @@ app.put('/api/agendas/:externalId/blocks/:blockId', async (req, res) => {
   }
 
   const updated = await prisma.$transaction(async (tx) => {
-    const freshAgenda = await tx.agenda.findUnique({ where: { id: agenda.id } });
     const block = await resolveBlockOr404(tx, agenda.id, req.params.blockId, res);
     if (!block) return null;
-    const professional = await tx.agendaProfessional.findUnique({ where: { id: block.professionalId } });
+    // `null` explícito borra la prestación (ej. al marcar un bloque como turno); `undefined` la conserva.
     const nextInput = {
-      proceso: req.body?.proceso ?? block.process,
-      actividad: req.body?.actividad ?? block.activity,
+      proceso: req.body?.proceso !== undefined ? req.body.proceso : block.process,
+      actividad: req.body?.actividad !== undefined ? req.body.actividad : block.activity,
     };
-    const catalogActivity = await resolveCatalogActivityForBlock(tx, freshAgenda, professional.type, nextInput);
-    if (nextInput.actividad && !catalogActivity) {
-      throw new Error('ACTIVITY_NOT_ALLOWED');
+    // Solo se vuelve a consultar el catálogo y el rendimiento sugerido si cambió la prestación.
+    // Cambios de día, horas, cupos, box, observaciones o turno no lo necesitan, y cada consulta
+    // es un viaje de ida y vuelta a la base (Neon, en EE.UU.) que hacía lento cada guardado.
+    const cambiaPrestacion = req.body?.proceso !== undefined || req.body?.actividad !== undefined;
+    let catalogActivity = null;
+    let perf = { suggestedPerformance: block.suggestedPerformance, performanceSource: block.performanceSource };
+    if (cambiaPrestacion) {
+      const professional = await tx.agendaProfessional.findUnique({ where: { id: block.professionalId } });
+      const specialty = effectiveSpecialty(agenda, professional);
+      catalogActivity = await resolveCatalogActivityForBlock(tx, specialty, professional.type, nextInput);
+      if (nextInput.actividad && !catalogActivity) {
+        throw new Error('ACTIVITY_NOT_ALLOWED');
+      }
+      perf = await resolveSuggestedPerformance(tx, specialty, {
+        process: nextInput.proceso,
+        activity: nextInput.actividad,
+      });
     }
-    const perf = await resolveSuggestedPerformance(tx, freshAgenda, {
-      process: nextInput.proceso,
-      activity: nextInput.actividad,
-    });
     const next = await tx.agendaBlock.update({
       where: { id: block.id },
       data: {
-        catalogActivityId: catalogActivity?.id ?? null,
+        catalogActivityId: cambiaPrestacion ? (catalogActivity?.id ?? null) : block.catalogActivityId,
         day: typeof req.body?.dia === 'string' ? req.body.dia : block.day,
         startMinutes: req.body?.inicioMin != null ? Number(req.body.inicioMin) : block.startMinutes,
         durationMinutes: req.body?.duracionMin != null ? Number(req.body.duracionMin) : block.durationMinutes,
@@ -2013,7 +2058,12 @@ app.put('/api/agendas/:externalId/blocks/:blockId', async (req, res) => {
         performanceSource: perf.performanceSource,
         box: req.body?.box !== undefined ? req.body.box : block.box,
         observations: req.body?.observaciones !== undefined ? req.body.observaciones : block.observations,
-        isShift: req.body?.esTurno !== undefined ? Boolean(req.body.esTurno) : block.isShift,
+        // Un bloque de turno no tiene actividad de catálogo: si al editarlo se le asigna una
+        // (ej. "Turno Hospitalizados" -> "Atención en sala"), pasa a ser jornada, salvo que se
+        // indique explícitamente esTurno. Si no, seguiría excluido de horas y mapa de calor.
+        isShift: req.body?.esTurno !== undefined
+          ? Boolean(req.body.esTurno)
+          : (req.body?.actividad !== undefined && catalogActivity ? false : block.isShift),
       },
     });
     await recomputeAgendaDerivedData(tx, agenda.id);
@@ -2046,7 +2096,7 @@ app.put('/api/agendas/:externalId/blocks/:blockId', async (req, res) => {
 });
 
 app.delete('/api/agendas/:externalId/blocks/:blockId', async (req, res) => {
-  if (!requireRoles(req, res, ['jefe_servicio', 'admin'])) return;
+  if (!requireRoles(req, res, ['jefe_servicio', 'admin', 'referente_programacion'])) return;
   const agenda = await loadAgendaOr404(req.params.externalId, res);
   if (!agenda) return;
   if (!canEditAgenda(req.authUser, agenda)) {
@@ -2067,9 +2117,10 @@ app.delete('/api/agendas/:externalId/blocks/:blockId', async (req, res) => {
 
 app.get('/api/profesionales', async (req, res) => {
   if (!requireAuth(req, res)) return;
+  const periodo = await resolvePeriodo(req);
   const where = req.authUser.role === 'jefe_servicio'
-    ? { agenda: { serviceId: { in: req.authUser.serviceIds?.length ? req.authUser.serviceIds : ['__no_service__'] } } }
-    : {};
+    ? { agenda: { planningPeriod: periodo, serviceId: { in: req.authUser.serviceIds?.length ? req.authUser.serviceIds : ['__no_service__'] } } }
+    : { agenda: { planningPeriod: periodo } };
 
   const professionals = await prisma.agendaProfessional.findMany({
     where,
@@ -2302,10 +2353,58 @@ app.get('/api/services/:serviceId/shift-roster', async (req, res) => {
     include: { members: true, overrides: true },
   });
 
+  // Turnos fijos semanales cargados en la agenda (bloques isShift, ej. "Turno Hospitalizados" los
+  // miércoles): se muestran en el calendario en cada fecha de ese día de semana, tomando la
+  // agenda del servicio vigente en esa fecha (la 2026 hasta diciembre, la 2027 desde enero).
+  // Son de solo lectura aquí — se editan en la agenda, no en las rotaciones.
+  const agendasServicio = await prisma.agenda.findMany({
+    where: {
+      serviceId,
+      AND: [
+        { OR: [{ validFrom: null }, { validFrom: { lte: to } }] },
+        { OR: [{ validTo: null }, { validTo: { gte: from } }] },
+      ],
+    },
+    select: { id: true, externalId: true, validFrom: true, validTo: true, planningPeriod: true },
+  });
+  const turnosFijos = agendasServicio.length
+    ? await prisma.agendaBlock.findMany({
+        where: { agendaId: { in: agendasServicio.map((a) => a.id) }, isShift: true },
+        select: { agendaId: true, day: true, startMinutes: true, durationMinutes: true, activity: true, professional: { select: { id: true, name: true } } },
+      })
+    : [];
+  const DIA_POR_JS = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+  // Agendas vigentes en esa fecha. Un servicio puede tener varias agendas en el mismo periodo
+  // (ej. Ginecología y Obstetricia): se consideran todas las del periodo más reciente.
+  const agendasVigentesEn = (date) => {
+    const vigentes = agendasServicio.filter((a) => (!a.validFrom || a.validFrom <= date) && (!a.validTo || a.validTo >= date));
+    if (!vigentes.length) return new Set();
+    const periodoMax = Math.max(...vigentes.map((a) => a.planningPeriod));
+    return new Set(vigentes.filter((a) => a.planningPeriod === periodoMax).map((a) => a.id));
+  };
+  const puestosFijos = Array.from(new Set(turnosFijos.map((b) => b.activity || 'Turno')));
+
   const days = [];
   for (let t = dateOnlyUTC(from); t <= dateOnlyUTC(to); t += 24 * 60 * 60 * 1000) {
     const date = new Date(t);
-    const entries = rotations.flatMap((rotation) => {
+    const agendasDia = agendasVigentesEn(date);
+    const fijos = agendasDia.size
+      ? turnosFijos
+          .filter((b) => agendasDia.has(b.agendaId) && b.day === DIA_POR_JS[date.getUTCDay()])
+          .map((b) => ({
+            unidad: 'Agenda',
+            puesto: b.activity || 'Turno',
+            startMinutes: b.startMinutes,
+            durationMinutes: b.durationMinutes,
+            professionalId: b.professional.id,
+            professionalName: b.professional.name,
+            esSustitucion: false,
+            tramoSplit: null,
+            origen: 'agenda',
+            agendaId: agendasServicio.find((x) => x.id === b.agendaId)?.externalId || null,
+          }))
+      : [];
+    const entries = fijos.concat(rotations.flatMap((rotation) => {
       const resolved = resolveShiftForDate(rotation, date);
       return resolved.map((r) => ({
         unidad: rotation.unidad,
@@ -2317,7 +2416,7 @@ app.get('/api/services/:serviceId/shift-roster', async (req, res) => {
         esSustitucion: r.isOverride,
         tramoSplit: r.tramoSplit ?? null,
       }));
-    });
+    }));
     days.push({ date: date.toISOString().slice(0, 10), entries });
   }
 
@@ -2499,7 +2598,8 @@ app.get('/api/services/:serviceId/shift-roster', async (req, res) => {
 
   res.json({
     unidades: Array.from(new Set(rotations.map((r) => r.unidad))),
-    puestos: Array.from(new Set(rotations.map((r) => r.puesto))),
+    puestos: Array.from(new Set([...rotations.map((r) => r.puesto), ...puestosFijos])),
+    puestosFijosAgenda: puestosFijos,
     dias: days,
     turnosUltimos30Dias: Array.from(countsMap.entries()).map(([professionalName, count]) => ({ professionalName, count })),
     proyeccion,

@@ -43,6 +43,7 @@ export function serializeAgenda(record) {
       esSoloTurno: professional.isShiftOnly,
       tieneTurno: professional.hasTurno,
       rut: professional.rut,
+      especialidad: professional.specialtyCatalog ?? null,
     }));
 
   const professionalIdMap = new Map(
@@ -83,6 +84,7 @@ export function serializeAgenda(record) {
     servicioId: record.serviceId,
     jefe: record.chiefName,
     mes: record.monthLabel,
+    periodo: record.planningPeriod,
     vigenciaDesde: record.validFrom ? record.validFrom.toISOString().slice(0, 10) : null,
     vigenciaHasta: record.validTo ? record.validTo.toISOString().slice(0, 10) : null,
     estado: record.status,
@@ -110,8 +112,18 @@ export async function ensureServiceByName(prismaOrTx, name, chiefName) {
   });
 }
 
+// Periodo de programación de una agenda: el explícito si viene, si no el año de inicio de vigencia.
+export function resolvePlanningPeriod(agenda) {
+  const explicito = Number(agenda.periodo);
+  if (Number.isInteger(explicito) && explicito > 2000) return explicito;
+  const desde = agenda.vigenciaDesde ? new Date(agenda.vigenciaDesde) : null;
+  if (desde && !isNaN(desde)) return desde.getUTCFullYear();
+  return undefined; // deja el valor actual (update) o el default del esquema (create)
+}
+
 export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
   const service = await ensureServiceByName(prismaOrTx, agenda.servicio, agenda.jefe);
+  const planningPeriod = resolvePlanningPeriod(agenda);
 
   const agendaRecord = existingId
     ? await prismaOrTx.agenda.update({
@@ -122,6 +134,7 @@ export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
           serviceName: agenda.servicio,
           chiefName: agenda.jefe,
           monthLabel: agenda.mes,
+          ...(planningPeriod ? { planningPeriod } : {}),
           validFrom: agenda.vigenciaDesde ? new Date(agenda.vigenciaDesde) : null,
           validTo: agenda.vigenciaHasta ? new Date(agenda.vigenciaHasta) : null,
           status: agenda.estado,
@@ -146,6 +159,7 @@ export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
           serviceName: agenda.servicio,
           chiefName: agenda.jefe,
           monthLabel: agenda.mes,
+          ...(planningPeriod ? { planningPeriod } : {}),
           validFrom: agenda.vigenciaDesde ? new Date(agenda.vigenciaDesde) : null,
           validTo: agenda.vigenciaHasta ? new Date(agenda.vigenciaHasta) : null,
           status: agenda.estado,
@@ -193,6 +207,7 @@ export async function writeAgendaGraph(prismaOrTx, agenda, existingId = null) {
         hasTurno: Boolean(professional.tieneTurno ?? false),
         isShiftOnly: Boolean(professional.esSoloTurno ?? false),
         rut: professional.rut ?? null,
+        specialtyCatalog: professional.especialidad || null,
         sortOrder: index,
       };
     });

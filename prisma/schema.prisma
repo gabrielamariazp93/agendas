@@ -50,6 +50,10 @@ model Agenda {
   serviceName     String
   chiefName       String
   monthLabel      String
+  // Periodo de programación (año) al que pertenece la agenda, ej. 2026, 2027. Permite tener la
+  // agenda vigente y la del próximo periodo de un mismo servicio a la vez sin que se sumen en
+  // tableros, cruce RRHH ni pabellón — todo se filtra por periodo.
+  planningPeriod  Int                @default(2026)
   validFrom       DateTime?
   validTo         DateTime?
   status          String
@@ -78,6 +82,7 @@ model Agenda {
 
   @@index([serviceId, status])
   @@index([chiefUserId])
+  @@index([planningPeriod])
 }
 
 model AgendaProfessional {
@@ -94,6 +99,10 @@ model AgendaProfessional {
   // RRHH (Dotación) por identificador único en vez de por nombre. Opcional: no todos los
   // profesionales ya cargados lo tienen todavía.
   rut        String?
+  // Especialidad del catálogo propia del profesional. Null = usa la del servicio/agenda
+  // (Agenda.serviceSpecialty). Existe para agendas que agrupan varias especialidades por
+  // dispositivo, ej. CESAM con psiquiatría adulto e infanto-juvenil en una sola agenda.
+  specialtyCatalog String?
   sortOrder  Int          @default(0)
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt
